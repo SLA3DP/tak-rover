@@ -202,15 +202,19 @@ const CONTROLS = {
      note: "벽에 닿기 전에 돌면 늘리고, 벽을 너무 오래 밀면 줄이세요."},
     {key: "turn", label: "도는 방향을 모를 때", choice: [["left", "왼쪽"], ["right", "오른쪽"]]},
     {key: "sign_rules", label: "표지판 규칙", choice: [[true, "켬"], [false, "끔"]]},
-    {key: "stop_action", label: "STOP 표지판이 가까우면", choice: [["stop", "멈춤"], ["ignore", "무시"]]},
+    {key: "stop_action", label: "STOP 표지판이 보이면", choice: [["stop", "주행 종료"], ["ignore", "무시"]]},
+    {key: "stop_conf", label: "STOP 확신도 기준", min: 0.3, max: 0.98, step: 0.01, pct: true,
+     note: "STOP 박스의 확신도가 이 이상이면 바로 주행을 끝냅니다. 엉뚱한 물체에 끝나면 올리세요."},
+    {key: "stop_size", label: "STOP을 인정하는 최소 크기", min: 0, max: 0.8, step: 0.01, pct: true,
+     note: "STOP 박스 높이가 화면 높이의 이 비율 이상이면 끝냅니다. 기본 5%는 아주 작은 오인식만 거르는 값입니다. 너무 멀리서 끝나면 올리세요 (아래 '표지판' 줄의 크기 숫자 참고)."},
     {key: "uturn_line", label: "파란 유턴 표지판이 가까우면", choice: [["ignore", "무시"], ["turn", "180도 회전"]]},
     {key: "animal_action", label: "길에 동물이 보이면", choice: [["detour", "다른 길로"], ["wait", "기다림"], ["ignore", "무시"]]},
     {key: "animal_size", label: "동물을 가깝다고 보는 크기", min: 0.05, max: 0.6, step: 0.01, pct: true,
      note: "동물 박스 높이가 화면 높이의 이 비율 이상이고 화면 가운데 쪽에 있을 때 반응합니다."},
-    {key: "sign_near", label: "표지판을 가깝다고 보는 크기", min: 0.1, max: 0.8, step: 0.01, pct: true,
-     note: "표지판 높이가 화면 높이의 이 비율 이상이면 반응합니다. 아래 '표지판' 줄의 크기 숫자를 보고 맞추세요."},
-    {key: "sign_conf", label: "표지판 확신도 기준", min: 0.3, max: 0.98, step: 0.01, pct: true,
-     note: "이보다 낮은 인식은 점선으로만 보여 주고 주행에는 쓰지 않습니다."},
+    {key: "sign_near", label: "다른 표지판을 가깝다고 보는 크기", min: 0.1, max: 0.8, step: 0.01, pct: true,
+     note: "STOP이 아닌 표지판은 높이가 화면 높이의 이 비율 이상일 때 반응합니다. 아래 '표지판' 줄의 크기 숫자를 보고 맞추세요."},
+    {key: "sign_conf", label: "다른 표지판 확신도 기준", min: 0.3, max: 0.98, step: 0.01, pct: true,
+     note: "이보다 낮은 인식은 점선으로만 보여 주고 주행에는 쓰지 않습니다 (STOP은 위의 기준을 따릅니다)."},
   ],
   "set-line-more": [
     {key: "kp", label: "조향 세기 (kp)", min: 0, max: 4, step: 0.1},
@@ -393,7 +397,7 @@ function paint() {
   if (st.view !== "hand") {
     facts.push(["선", road ? (road.seen ? `보임 · 치우침 ${road.error > 0 ? "오른쪽" : road.error < 0 ? "왼쪽" : "가운데"} ${Math.abs(road.error).toFixed(2)} · 확신도 ${pct(road.confidence)}` : `안 보임 (확신도 ${pct(road.confidence)})`) : "인식 결과 없음"]);
   }
-  facts.push(["표지판", st.signs.length ? st.signs.map(sign => `${signName(sign)} ${pct(sign.confidence)} · 크기 ${pct(sign.tall)}${sign.near ? " · 가까움" : sign.cut ? " · 화면 끝에 걸려 제외" : sign.sure ? "" : " · 확신도 낮음"}`).join(" / ") : "없음"]);
+  facts.push(["표지판", st.signs.length ? st.signs.map(sign => `${signName(sign)} ${pct(sign.confidence)} · 크기 ${pct(sign.tall)}${sign.near ? (sign.kind === "stop" ? " · 주행 종료 대상" : " · 가까움") : sign.cut ? " · 화면 옆·아래 끝에 걸려 제외" : sign.sure ? "" : " · 확신도 낮음"}`).join(" / ") : "없음"]);
   if (st.view !== "hand") {
     const wall = name => st.front.rows[name] == null ? "없음" : pct(st.front.rows[name]);
     facts.push(["앞 벽", st.front.ok ? `앞 ${wall("C")} · 왼쪽 ${wall("L")} · 오른쪽 ${wall("R")} · 화면 가림 ${pct(st.front.fill)} (${pct(st.params.wall_fill)} 넘으면 벽 앞)` : (st.front.error || "화면 분석 대기")]);

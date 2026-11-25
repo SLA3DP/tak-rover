@@ -51,7 +51,8 @@ DEFAULTS = {
     "base": 150, "kp": 1.6, "ki": 0.6, "tmax": 0.4, "slow": 0.45, "coast": 0.5,
     "pivot": 220, "search": 3.5, "min_conf": 0.5, "turn": "right",
     "corner_mode": "wall", "turn90": 1.2, "bump_push": 1.0, "bump_max": 2.5, "wall_fill": 0.85,
-    "sign_rules": True, "stop_action": "stop", "sign_conf": 0.75, "sign_near": 0.25,
+    "sign_rules": True, "stop_action": "stop", "stop_conf": 0.5, "stop_size": 0.05,
+    "sign_conf": 0.75, "sign_near": 0.25,
     "detour_min": 1.2, "detour_max": 6.0,
     "animal_action": "detour", "animal_size": 0.16, "uturn_line": "ignore", "uturn_time": 2.4,
     "hand_base": 130, "hand_pivot": 200, "hand_stop_area": 0.075, "hand_center": 0.35,
@@ -62,12 +63,13 @@ LIMITS = {
     "base": (0, 255), "kp": (0, 5), "ki": (0, 3), "tmax": (0.1, 1.5), "slow": (0, 0.9), "coast": (0, 2),
     "pivot": (0, 255), "search": (0.5, 8), "min_conf": (0.2, 0.95),
     "turn90": (0.3, 3.0), "bump_push": (0, 2.5), "bump_max": (1, 6), "wall_fill": (0.6, 0.98),
+    "stop_conf": (0.3, 0.99), "stop_size": (0.0, 0.9),
     "sign_conf": (0.3, 0.99), "sign_near": (0.05, 0.9), "detour_min": (0.3, 4), "detour_max": (2, 12),
     "animal_size": (0.05, 0.6), "uturn_time": (0.6, 6.0),
     "hand_base": (0, 255), "hand_pivot": (0, 255), "hand_stop_area": (0.01, 0.5), "hand_center": (0.1, 0.9),
     "manual_speed": (0, 255), "manual_turn": (0, 255), "manual_strafe": (0, 255),
 }
-CHOICES = {"turn": ("left", "right"), "stop_action": ("stop", "detour", "ignore"), "corner_mode": ("wall", "search"),
+CHOICES = {"turn": ("left", "right"), "stop_action": ("stop", "ignore"), "corner_mode": ("wall", "search"),
            "animal_action": ("detour", "wait", "ignore"), "uturn_line": ("ignore", "turn")}
 FLAGS = ("sign_rules", "motors")
 MOVES = {"w": (1, 0, 0), "s": (-1, 0, 0), "a": (0, 0, 1), "d": (0, 0, -1), "q": (0, 1, 0), "e": (0, -1, 0)}
@@ -367,7 +369,7 @@ class Rover:
 
     # ---------- 표지판 ----------
     def sign_action(self, label):
-        """자율 주행에서 가까워졌을 때 할 일: stop(멈춤), detour(그 길로 가지 않고 다른 선), turn(180도), ignore."""
+        """표지판마다 할 일: stop(보이면 주행 종료), detour(가까우면 그 길로 가지 않고 다른 선), turn(180도), ignore."""
         if label in STOP_SIGNS:
             return self.params["stop_action"]
         if label == UTURN_SIGN:
@@ -388,12 +390,25 @@ class Rover:
                 label = str(sign.get("label", ""))
             except (KeyError, TypeError, ValueError):
                 continue
-            tall = h / HEIGHT
-            # 화면 끝에 걸린 박스는 쓰지 않는다 (일부만 보이는 물체: 빨간 의자를 정지 표지판으로 잡은 적이 있다)
-            cut = x <= 4 or y <= 4 or x + w >= WIDTH - 4 or y + h >= HEIGHT - 4
-            sure = confidence >= P["sign_conf"] and not cut
-            box = [round(x), round(y), round(x + w), round(y + h)]
+            # 화면 끝에 걸린 박스는 쓰지 않는다 (일부만 보이는 물체: 빨간 의자를 정지 표지판으로 잡은 적이 있다).
+            # 다만 다가가면 표지판은 화면 위쪽으로 빠져나가므로, 위쪽에만 걸리고 절반 넘게 보이면 인정한다
+            # (2026-11-25 실제 STOP: 박스 [241, 0, 369, 127]). 그때 크기는 잘리지 않은 폭으로 잰다.
+            side = x <= 4 or x + w >= WIDTH - 4 or y + h >= HEIGHT - 4
+            top = y <= 4
+            top_only = top and not side and h >= 0.5 * w
+            cut = (top or side) and not top_only
+            tall = (max(h, w) if top_only else h) / HEIGHT
             kind = "stop" if label in STOP_SIGNS else "uturn" if label == UTURN_SIGN else "avoid"
+            # STOP 은 보이면 바로 주행을 끝내야 해서 기준이 따로 있다. 팀이 찍어 둔 STOP 사진 127장에서 박스 높이는
+            # 화면의 7~20%, 확신도는 대부분 0.9 이상이었다: 예전 기준(25% 이상, 0.75 이상)으로는 15장만 잡혔다.
+            # 그래서 확신도 0.5, 크기는 아주 작은 오인식만 거르는 5% 를 기본으로 한다.
+            if kind == "stop":
+                sure = confidence >= P["stop_conf"] and not cut
+                near = sure and tall >= P["stop_size"]
+            else:
+                sure = confidence >= P["sign_conf"] and not cut
+                near = sure and tall >= P["sign_near"]
+            box = [round(x), round(y), round(x + w), round(y + h)]
             if label == UTURN_SIGN:
                 # 유턴 화살표 모양인데 파랗지 않고 빨간 표지판이면 유턴 금지로 본다 (모델에는 그 종류가 없다)
                 colors = self.front.colors(box)
@@ -402,18 +417,36 @@ class Rover:
             out.append({
                 "label": label, "confidence": round(confidence, 3), "box": box,
                 "tall": round(tall, 3), "center": round((x + w / 2) / WIDTH * 2 - 1, 3),
-                "cut": cut, "sure": sure, "near": sure and tall >= P["sign_near"],
+                "cut": cut, "sure": sure, "near": near,     # near: 주행이 반응하는 표지판 (STOP 은 보이는 즉시)
                 # 유턴 금지: 자율 주행에서는 다른 표지판처럼 그 길을 피하고, 손 추적에서는 hand_sign 이 멈춘다
                 "kind": kind, "action": "detour" if kind == "nouturn" else self.sign_action(label),
             })
         return out
 
+    def stop_ahead(self, now):
+        """STOP 표지판이 보이면 그 표지판. 최근 인식 결과 4개 중 2개 이상에서 보이고 지금도 보일 때만 알린다
+        (한 번 번쩍한 오인식으로 주행이 끝나지 않게, 그리고 확신도가 기준 근처에서 오르내려도 놓치지 않게)."""
+        P = self.params
+        found = None
+        if P["sign_rules"] and P["stop_action"] == "stop":
+            for sign in self.signs_now(now):
+                if sign["kind"] == "stop" and sign["near"] and (found is None or sign["tall"] > found["tall"]):
+                    found = sign
+        seq = (self.percept.get("vision_timing") or {}).get("sign_sequence")
+        if seq is None:
+            seq = int(now * 4)
+        if seq != self.stop_seq:
+            self.stop_seq = seq
+            self.stop_recent.append(found is not None)
+        return found if found is not None and sum(self.stop_recent) >= 2 else None
+
     def find_near(self, now):
-        """가까운 표지판 중 가장 큰 것. 인식 결과가 2회 연속으로 가까울 때만 confirmed."""
+        """STOP 을 뺀 가까운 표지판 중 가장 큰 것. 인식 결과가 2회 연속으로 가까울 때만 confirmed."""
         near = None
         if self.params["sign_rules"] and now >= self.sign_ignore_until:
             for sign in self.signs_now(now):
-                if sign["near"] and sign["action"] != "ignore" and (near is None or sign["tall"] > near["tall"]):
+                if sign["kind"] != "stop" and sign["near"] and sign["action"] != "ignore" \
+                        and (near is None or sign["tall"] > near["tall"]):
                     near = sign
         seq = (self.percept.get("vision_timing") or {}).get("sign_sequence")
         if seq is None:
@@ -473,6 +506,8 @@ class Rover:
         self.sign_ignore_until = 0.0
         self.near_hits = 0
         self.near_seq = object()
+        self.stop_recent = collections.deque(maxlen=4)
+        self.stop_seq = object()
         self.detour_side = 1
         self.detour_at = 0.0
         self.stale_since = None
@@ -613,11 +648,15 @@ class Rover:
         valid = error is not None and conf >= P["min_conf"]
         pivot = int(P["pivot"])
 
+        # STOP 표지판이 보이면 바로 자율 주행을 끝낸다. 우회나 벽 회전 중이어도, 다른 표지판보다 먼저 본다
+        stop_sign = self.stop_ahead(now)
+        if stop_sign is not None:
+            return self.stop_active(
+                f"STOP 표지판이 보여 자율 주행을 끝냈습니다 (확신도 {stop_sign['confidence'] * 100:.0f}%)")
+
         near, confirmed = self.find_near(now)
         if confirmed and self.line_state != "detour":
             name = "유턴 금지" if near["kind"] == "nouturn" else SIGN_KO.get(near["label"], near["label"])
-            if near["action"] == "stop":
-                return self.stop_active(f"{name} 표지판 앞에서 멈췄습니다")
             if near["action"] == "turn":
                 # 파란 유턴 표지판 (설정에서 켰을 때만): 제자리에서 180도 돈 뒤 직진하며 선을 찾는다
                 self.sign_ignore_until = now + P["uturn_time"] + 3.0
@@ -761,7 +800,7 @@ class Rover:
                 if sign["kind"] == "nouturn":
                     found = ("stop", "유턴 금지")
                     break
-                if sign["label"] in STOP_SIGNS and sign["near"]:
+                if sign["kind"] == "stop" and sign["near"] and self.params["stop_action"] == "stop":
                     found = ("stop", "STOP")
                     break
                 if sign["kind"] == "uturn" and now >= self.hand_uturn_ignore:
