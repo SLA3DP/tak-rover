@@ -14,9 +14,11 @@
 """
 import collections
 import json
+import math
 import os
 import re
 import secrets
+import shutil
 import signal
 import sys
 import threading
@@ -32,6 +34,8 @@ EXTRA_DIR = os.path.join(HOME, "rover_animals/out")
 EXTRA_FILE = os.path.join(EXTRA_DIR, "extra.json")
 MODE_FILE = os.path.join(EXTRA_DIR, "mode.txt")
 RUN_DIR = os.path.join(HOME, "rover_runs")
+AUTO_DIR = os.path.join(RUN_DIR, "auto")      # 자율 주행 중 남기는 화면·상태 기록
+ROAD_CONFIG = os.path.join(HOME, "robot_ws/.runtime/venue_yolo.yaml")
 PIN_FILE = os.path.join(UI_DIR, "pin.txt")
 PARAM_FILE = os.path.join(UI_DIR, "params.json")
 PAGE_FILE = os.path.join(UI_DIR, "index.html")
@@ -51,6 +55,7 @@ DEFAULTS = {
     "base": 150, "kp": 1.6, "ki": 0.6, "tmax": 0.4, "slow": 0.45, "coast": 0.5,
     "pivot": 220, "search": 3.5, "min_conf": 0.5, "turn": "right",
     "corner_mode": "wall", "turn90": 1.2, "bump_push": 1.0, "bump_max": 2.5, "wall_fill": 0.85,
+    "steer": "strafe", "strafe_gain": 150, "turn_gain": 150, "shift_at": 0.35, "shift_pwm": 220,
     "sign_rules": True, "stop_action": "stop", "stop_conf": 0.5, "stop_size": 0.05,
     "sign_conf": 0.75, "sign_near": 0.25,
     "detour_min": 1.2, "detour_max": 6.0,
@@ -64,12 +69,14 @@ LIMITS = {
     "pivot": (0, 255), "search": (0.5, 8), "min_conf": (0.2, 0.95),
     "turn90": (0.3, 3.0), "bump_push": (0, 2.5), "bump_max": (1, 6), "wall_fill": (0.6, 0.98),
     "stop_conf": (0.3, 0.99), "stop_size": (0.0, 0.9),
+    "strafe_gain": (0, 600), "turn_gain": (0, 600), "shift_at": (0.1, 1.5), "shift_pwm": (120, 255),
     "sign_conf": (0.3, 0.99), "sign_near": (0.05, 0.9), "detour_min": (0.3, 4), "detour_max": (2, 12),
     "animal_size": (0.05, 0.6), "uturn_time": (0.6, 6.0),
     "hand_base": (0, 255), "hand_pivot": (0, 255), "hand_stop_area": (0.01, 0.5), "hand_center": (0.1, 0.9),
     "manual_speed": (0, 255), "manual_turn": (0, 255), "manual_strafe": (0, 255),
 }
 CHOICES = {"turn": ("left", "right"), "stop_action": ("stop", "ignore"), "corner_mode": ("wall", "search"),
+           "steer": ("strafe", "turn"),
            "animal_action": ("detour", "wait", "ignore"), "uturn_line": ("ignore", "turn")}
 FLAGS = ("sign_rules", "motors")
 MOVES = {"w": (1, 0, 0), "s": (-1, 0, 0), "a": (0, 0, 1), "d": (0, 0, -1), "q": (0, 1, 0), "e": (0, -1, 0)}
@@ -89,6 +96,254 @@ def mecanum(vx, vy, w):
 def pivot_command(direction, pwm):
     """direction +1 = 시계 방향(오른쪽으로 회전)."""
     return f"M {direction * pwm} {-direction * pwm}"
+
+
+# ---------- 두꺼운 중앙선 추적 ----------
+# 인식 스택(road_paths.py)은 선의 굵기를 보지 않고 화면 가운데에 가장 가까운 노란 띠를 중앙선으로 고른다.
+# 그래서 얇은 테두리 선을 따라가거나, 두 선이 비슷한 거리에 있으면 선을 놓친 것으로 처리한다.
+# 여기서는 굵기로 고른다. 숫자는 반 크기 화면(320x240) 기준이고 2026-11-25 대회장 사진으로 맞췄다:
+# 중앙선의 가로 폭은 줄 y 에서 약 0.143 * (y - 7) 픽셀, 테두리 선은 그 1/5 쯤이다.
+LINE_HORIZON = 7.0        # 바닥의 선 폭이 0 이 되는 줄 (지평선)
+LINE_WIDTH_K = 0.143      # 중앙선의 가로 폭 = LINE_WIDTH_K * (y - LINE_HORIZON)
+LINE_FOCAL = 314.0        # 초점 거리 (수평 화각 54도)
+LINE_PITCH = math.atan((120.0 - LINE_HORIZON) / LINE_FOCAL)     # 카메라가 아래로 숙인 각도 (약 20도)
+
+
+def read_hsv():
+    """인식 스택 설정에서 노란색 HSV 범위를 읽는다 (같은 색을 보게). 못 읽으면 대회장 값."""
+    low, high = (15, 0, 170), (45, 255, 255)
+    try:
+        with open(ROAD_CONFIG) as handle:
+            text = handle.read()
+        found = {name: tuple(int(v) for v in re.search(name + r"\s*:\s*\[([^\]]+)\]", text).group(1).split(","))
+                 for name in ("hsv_low", "hsv_high")}
+        if len(found["hsv_low"]) == 3 and len(found["hsv_high"]) == 3:
+            low, high = found["hsv_low"], found["hsv_high"]
+    except (OSError, AttributeError, ValueError):
+        pass
+    return low, high
+
+
+def yellow_mask(a, np, low, high, value=None):
+    """RGB(int16) 화면에서 OpenCV HSV 범위(H 0..180)에 드는 픽셀. value 는 미리 구한 밝기(채널 최댓값).
+    밝기 조건에 드는 픽셀만 골라 색상을 계산한다 (매트 위에서는 화면의 1~2할뿐이라 Pi 에서 몇 배 빠르다)."""
+    if value is None:
+        value = np.maximum(np.maximum(a[..., 0], a[..., 1]), a[..., 2])
+    bright = (value >= low[2]) & (value <= high[2])
+    mask = np.zeros(value.shape, dtype=bool)
+    if not bright.any():
+        return mask
+    px = a[bright]
+    r, g, b = px[:, 0], px[:, 1], px[:, 2]
+    mx = value[bright]
+    mn = np.minimum(np.minimum(r, g), b)
+    d = (mx - mn).astype(np.float32)
+    safe = np.where(d > 0, d, 1.0)
+    hue = np.where(mx == r, (g - b) * 30.0 / safe,
+                   np.where(mx == g, 60.0 + (b - r) * 30.0 / safe, 120.0 + (r - g) * 30.0 / safe))
+    hue = np.where(hue < 0, hue + 180.0, hue)
+    hue = np.where(d > 0, hue, 0.0)
+    sat = d * 255.0 / np.maximum(mx, 1)
+    mask[bright] = ((hue >= low[0] - 0.5) & (hue <= high[0] + 0.5) & (sat >= low[1] - 0.5) & (sat <= high[1] + 0.5))
+    return mask
+
+
+def _stands_out(cum, a, b, wide, both):
+    """노란 띠 [a, b) 가 양옆(both) 또는 한쪽보다 뚜렷이 밝은가. 밝은 바닥의 얼룩은 옆도 밝아서 걸러진다.
+    cum 은 그 줄 밝기의 누적합(앞에 0 을 붙인 목록): 구간 평균을 numpy 호출 없이 바로 구한다 (Pi 에서 느려서)."""
+    k = max(3, int(round(0.2 * wide)))
+    inside = (cum[b] - cum[a]) / float(b - a)
+    sides = []
+    if a - 1 - k >= 0:
+        sides.append((cum[a - 1] - cum[a - 1 - k]) / float(k))
+    if b + 1 + k <= len(cum) - 1:
+        sides.append((cum[b + 1 + k] - cum[b + 1]) / float(k))
+    if not sides:
+        return False
+    dark = [inside - side >= 30 for side in sides]
+    return all(dark) if both else any(dark)
+
+
+def _fit_line(points):
+    """(y, x) 점들에 x = x0 + m * (y - y0) 를 맞춘다. y0 는 첫 점(가장 아래)의 y."""
+    y0 = points[0][0]
+    n = len(points)
+    sy = sum(p[0] - y0 for p in points)
+    sx = sum(p[1] for p in points)
+    syy = sum((p[0] - y0) ** 2 for p in points)
+    sxy = sum((p[0] - y0) * p[1] for p in points)
+    den = n * syy - sy * sy
+    if n < 2 or den == 0:
+        return points[0][1], 0.0
+    m = (n * sxy - sy * sx) / den
+    return (sx - m * sy) / n, m
+
+
+def _trace_up(rows, start, x, width, w, h, stride, thick):
+    """rows[start] 의 띠 (x, width) 에서 위쪽 줄로 이어지는 띠를 따라간다."""
+    points = [(rows[start][0], x, width)]
+    after_bar = False
+    for y, wide, runs in rows[start + 1:]:
+        last_y, last_x, _ = points[-1]
+        ref = points[max(0, len(points) - 5)]
+        slope = (last_x - ref[1]) / (last_y - ref[0]) if last_y != ref[0] else 0.0
+        predicted = last_x + clamp(slope, -2.0, 2.0) * (y - last_y)
+        if last_y - y > (0.14 * h if after_bar else 4 * stride):
+            break
+        if thick:
+            if any(a <= predicted <= b and b - a > 2.2 * wide for a, b in runs):
+                after_bar = True          # 갈림길의 가로 선: 건너뛰고 그 너머에서 이어지는 선을 찾는다
+                continue
+            pool = [((a + b - 1) / 2.0, b - a) for a, b in runs if 0.55 * wide <= b - a <= 2.2 * wide]
+            radius = max(0.9 * wide, 0.045 * w) * (1.6 if after_bar else 1.0)
+        else:
+            pool = [((a + b - 1) / 2.0, b - a) for a, b in runs if 2 <= b - a <= 0.45 * wide]
+            radius = max(0.5 * wide, 0.035 * w)
+        near = [c for c in pool if abs(c[0] - predicted) <= radius]
+        if not near:
+            continue
+        cx, cw = min(near, key=lambda c: abs(c[0] - predicted))
+        points.append((y, cx, cw))
+        after_bar = False
+    return points
+
+
+def find_line(a, np, hsv, hint=None):
+    """반 크기 RGB 화면에서 두꺼운 중앙선과 양옆 얇은 테두리 선을 찾는다.
+
+    line (없으면 None): x 가까운 점의 좌우 위치 -1..1, row 그 점의 높이 0..1, offset 로버(카메라) 밑에서 선이 옆으로
+    떨어진 거리(카메라 높이 단위, + = 선이 오른쪽), angle 선 방향 - 로버 방향(rad, + = 선이 오른쪽으로 향함),
+    span 따라간 길이(화면 높이 비율), straight 그중 아래쪽에서 곧게 이어지는 길이, bend 그 위에서 꺾이는 쪽(-1 왼쪽,
+    0 없음, +1 오른쪽), conf 0..1 (곧은 구간의 길이로 매긴다), points 그리기용 점.
+    위치와 방향은 곧은 구간만으로 잰다: 코너에서 휘어 나가는 부분까지 넣으면 코너에 닿기 전에 미리 돌게 된다.
+    left, right: 테두리 선까지의 옆 거리(같은 단위, 왼쪽은 음수) 또는 None.
+    """
+    h, w = a.shape[:2]
+    scale = h / 240.0
+    horizon, focal = LINE_HORIZON * scale, LINE_FOCAL * scale
+    stride = max(2, int(round(3 * scale)))
+    top, bottom = int(h * 0.30), int(h * 0.955)
+    crop = a[top - 2:bottom + 3]
+    value = np.maximum(np.maximum(crop[..., 0], crop[..., 1]), crop[..., 2])
+    mask = yellow_mask(crop, np, hsv[0], hsv[1], value)
+    empty = {"line": None, "left": None, "right": None, "thin": []}
+    if float(mask.mean()) > 0.30:
+        return empty                          # 화면의 3할 넘게 노랗다: 매트 위가 아니다 (밝은 바닥)
+    # 볼 줄들을 한꺼번에 처리한다 (줄마다 numpy 를 부르면 Pi 에서 화면 한 장에 80ms 가 걸렸다)
+    ys = list(range(bottom, top, -stride))
+    idx = np.asarray(ys) - (top - 2)
+    bands = (mask[idx - 1].astype(np.int8) + mask[idx] + mask[idx + 1]) >= 2
+    padded = np.zeros((len(ys), w + 2), dtype=np.int8)
+    padded[:, 1:-1] = bands
+    edges = np.diff(padded, axis=1)
+    start_row, start_col = np.nonzero(edges == 1)
+    end_col = np.nonzero(edges == -1)[1]
+    per_row = [[] for _ in ys]
+    for r0, s0, e0 in zip(start_row.tolist(), start_col.tolist(), end_col.tolist()):
+        per_row[r0].append([s0, e0])
+    cums = np.concatenate((np.zeros((len(ys), 1), dtype=np.int64),
+                           np.cumsum(value[idx].astype(np.int64), axis=1)), axis=1).tolist()
+    rows = []
+    for n, y in enumerate(ys):
+        wide = LINE_WIDTH_K * (y - horizon)
+        gap = max(1.0, 0.08 * wide)
+        runs = []
+        for s0, e0 in per_row[n]:
+            if runs and s0 - runs[-1][1] <= gap:
+                runs[-1][1] = e0              # 테이프 이음매나 반사로 생긴 작은 틈은 잇는다
+            else:
+                runs.append([s0, e0])
+        if len(runs) > 12:
+            runs = []                         # 줄 전체가 얼룩덜룩하다: 매트가 아닌 바닥
+        cum = cums[n]
+        rows.append((y, wide, [(s0, e0) for s0, e0 in runs if e0 - s0 > 2.2 * wide
+                               or _stands_out(cum, s0, e0, wide, e0 - s0 >= 0.55 * wide)]))
+
+    # 1) 두꺼운 선: 아래쪽 줄부터 씨앗을 잡아 위로 따라가고, 가장 길게 이어지는 것을 고른다
+    cos_p, tan_p = math.cos(LINE_PITCH), math.tan(LINE_PITCH)
+    target = hint if hint is not None else w / 2.0
+    best, best_score, used, seeded = None, None, set(), 0
+    for i, (y, wide, runs) in enumerate(rows):
+        if seeded >= 14:
+            break
+        thick = [((s0 + e0 - 1) / 2.0, e0 - s0) for s0, e0 in runs if 0.55 * wide <= e0 - s0 <= 2.2 * wide]
+        seeded += 1 if thick else 0
+        for x, width in thick:
+            if (y, int(round(x))) in used:
+                continue
+            track = _trace_up(rows, i, x, width, w, h, stride, True)
+            used.update((p[0], int(round(p[1]))) for p in track)
+            if len(track) < 4:
+                continue
+            # 아래쪽부터 곧게 이어지는 구간을 찾는다 (새 점이 맞춘 직선에서 벗어나면 거기서부터는 꺾이는 부분)
+            pts = [(p[0], p[1]) for p in track]
+            k = min(len(pts), 5)
+            x0, m = _fit_line(pts[:k])
+            while k < len(pts):
+                py, px = pts[k]
+                if abs(px - (x0 + m * (py - y))) > max(1.5 * scale, 0.15 * LINE_WIDTH_K * (py - horizon)):
+                    break
+                k += 1
+                if k % 3 == 0:
+                    x0, m = _fit_line(pts[:k])
+            # 위에서 꺾이면, 곧은 구간의 끝부분은 이미 휘기 시작한 곳일 수 있어 아래쪽 7할로만 맞춘다
+            x0, m = _fit_line(pts[:max(4, int(k * 0.7))] if k < len(pts) else pts[:k])
+            if abs(m) > 2.0:
+                continue                      # 거의 가로로 누운 선: 갈림길 가지나 벽 쪽 선
+            # 기울어진 선은 가로로 잰 폭이 넓어 보인다. 선에 수직인 굵기로 고쳐서 얇은 선을 걸러낸다
+            ratios = sorted(p[2] / math.sqrt(1 + m * m) / (LINE_WIDTH_K * (p[0] - horizon)) for p in track)
+            if ratios[len(ratios) // 2] < 0.5:
+                continue
+            score = len(track) - 0.1 * abs(x0 - target) / scale
+            if best_score is None or score > best_score:
+                best, best_score = (track, x0, m, k), score
+    line, tan_angle = None, None
+    if best is not None:
+        track, x0, m, k = best
+        y0 = track[0][0]
+        span = track[0][0] - track[-1][0] + stride
+        straight = track[0][0] - track[k - 1][0] + stride
+        bend = 0
+        if k < len(track):
+            far = track[min(len(track) - 1, k + 3)]
+            bend = 1 if far[1] > x0 + m * (far[0] - y0) else -1
+        # 바닥의 직선은 화면에서도 직선이다: 지평선에서 만나는 점이 방향을, 기울기가 옆 거리를 준다
+        tan_angle = (x0 - m * (y0 - horizon) - w / 2.0) * cos_p / focal
+        line = {
+            "x": round(clamp(x0 / (w / 2.0) - 1.0, -1.0, 1.0), 3), "row": round(y0 / (h - 1.0), 3),
+            "offset": round(m / cos_p + tan_p * tan_angle, 3), "angle": round(math.atan(tan_angle), 3),
+            "span": round(span / float(h), 3), "n": len(track),
+            "straight": round(straight / float(h), 3), "bend": bend,
+            # 확신도: 곧은 구간이 화면 높이의 16% 면 0.5. 위에서 꺾이는 선은 22% 가 되어야 0.5 로 친다
+            # (코너 바로 앞에서는 보이는 선 전체가 휘어 있어 위치와 방향을 잴 수 없다. 그때는 따라가지 않는다)
+            "conf": round(min(1.0, straight / ((0.44 if bend else 0.32) * h)) * min(1.0, k * stride / float(straight)), 3),
+            "points": [[round(p[1] / (w - 1.0), 3), round(p[0] / (h - 1.0), 3)]
+                       for p in track[::max(1, len(track) // 9)]],
+        }
+
+    # 2) 얇은 테두리 선: 화면 아래쪽에서, 두꺼운 선의 양옆으로 가장 가까운 것
+    sides, thin = {"left": None, "right": None}, []
+    for name, sign in (("left", -1), ("right", 1)):
+        tried = 0
+        for i, (y, wide, runs) in enumerate(rows):
+            if y < h * 0.45 or tried >= 10:
+                break
+            middle = (x0 + m * (y - y0)) if best is not None else w / 2.0
+            pool = [((s0 + e0 - 1) / 2.0, e0 - s0) for s0, e0 in runs
+                    if 2 <= e0 - s0 <= 0.45 * wide and sign * ((s0 + e0 - 1) / 2.0 - middle) > 0.5 * wide]
+            if not pool:
+                continue
+            tried += 1
+            x, width = min(pool, key=lambda c: abs(c[0] - middle))
+            track = _trace_up(rows, i, x, width, w, h, stride, False)
+            if len(track) >= 5 and track[0][0] - track[-1][0] >= 0.06 * h:
+                bx, bm = _fit_line([(p[0], p[1]) for p in track])
+                tan_b = tan_angle if tan_angle is not None else (bx - bm * (track[0][0] - horizon) - w / 2.0) * cos_p / focal
+                sides[name] = round(bm / cos_p + tan_p * tan_b, 3)
+                thin.append([[round(p[1] / (w - 1.0), 3), round(p[0] / (h - 1.0), 3)]
+                             for p in track[::max(1, len(track) // 6)]])
+                break
+    return {"line": line, "left": sides["left"], "right": sides["right"], "thin": thin}
 
 
 class Uno:
@@ -161,6 +416,12 @@ class Front:
         self.error = "아직 화면을 분석하지 않았습니다"
         self.fast = False             # 자율 주행 중에는 매 화면, 아니면 가끔만 계산한다
         self.pixels = None            # 마지막으로 푼 화면 (반 크기, 박스 안 색을 볼 때 쓴다)
+        self.hsv = read_hsv()         # 노란 선의 색 범위 (인식 스택 설정과 같게)
+        self.line = None              # 두꺼운 중앙선 (find_line 의 line)
+        self.left = None              # 왼쪽·오른쪽 얇은 테두리 선까지의 옆 거리
+        self.right = None
+        self.thin = []
+        self.line_ms = 0.0
 
     def colors(self, box):
         """640×480 기준 [x1, y1, x2, y2] 안에서 파란색, 빨간색 픽셀이 차지하는 비율."""
@@ -218,8 +479,17 @@ class Front:
                         image.draft("RGB", (320, 240))
                         pixels = np.asarray(image.convert("RGB"), dtype=np.int16)
                     rows, fill = self.analyse(pixels, np)
+                    began = time.time()
+                    try:
+                        hint = (self.line["x"] + 1.0) / 2.0 * pixels.shape[1] if self.line else None
+                        found, problem = find_line(pixels, np, self.hsv, hint), ""
+                    except Exception as issue:      # 선 추적이 실패해도 벽 판단과 나머지는 계속 돈다
+                        found = {"line": None, "left": None, "right": None, "thin": []}
+                        problem = f"선 추적 오류: {type(issue).__name__}"
+                    self.line_ms = round((time.time() - began) * 1000.0, 1)
                     self.pixels = pixels
-                    self.rows, self.fill, self.at, self.error = rows, fill, time.time(), ""
+                    self.line, self.left, self.right, self.thin = found["line"], found["left"], found["right"], found["thin"]
+                    self.rows, self.fill, self.at, self.error = rows, fill, time.time(), problem
             except Exception as problem:
                 self.error = f"화면 분석 오류: {type(problem).__name__}"
             time.sleep(max(0.01, (0.03 if self.fast else 0.3) - (time.time() - started)))
@@ -489,6 +759,11 @@ class Rover:
     def reset_follower(self):
         self.filtered = None
         self.integral = 0.0
+        self.f_off = None             # 걸러 낸 옆 거리와 방향 차 (center_step)
+        self.f_ang = None
+        self.burst_until = 0.0        # 크게 벗어났을 때의 짧은 움직임 (끝나면 멈춰서 새 화면을 본다)
+        self.burst_cmd = "S"
+        self.burst_state = ""
         self.valid_at = None
         self.lost_at = None
         self.searching = False
@@ -502,6 +777,8 @@ class Rover:
         self.seen = False
         self.hint = 0
         self.hint_at = None
+        self.bend = 0                 # 마지막으로 본, 선이 앞에서 꺾이는 쪽
+        self.bend_at = 0.0
         self.line_state = "follow"
         self.sign_ignore_until = 0.0
         self.near_hits = 0
@@ -533,6 +810,7 @@ class Rover:
     def begin_turn(self, now, direction, length, why):
         self.wall_state = "turn"
         self.wall_dir = direction
+        self.bend_at = 0.0            # 꺾인 쪽 기억은 이번 회전에 썼다: 다음 코너는 새로 본 것으로 정한다
         self.wall_turn_at = now
         self.wall_turn_len = length
         self.wall_regain = 0
@@ -542,6 +820,8 @@ class Rover:
 
     def pick_side(self, now):
         """도는 방향과 그 근거. +1 = 오른쪽."""
+        if now - self.bend_at < 4.0:
+            return self.bend, "선이 꺾인 쪽"
         if now - self.open_at < 3.0 and abs(self.open_score) >= 0.1:
             return (1 if self.open_score > 0 else -1), "화면에서 열린 쪽"
         if self.last_good is not None and abs(self.last_good) >= 0.04:
@@ -628,9 +908,69 @@ class Rover:
         self.note(reason)
         return "S"
 
+    def line_view(self, now):
+        """(따라갈 수 있는가, 좌우 위치 -1..1, 추적 결과). 굵기로 고른 두꺼운 중앙선만 쓴다 (얇은 테두리 선은 쓰지 않는다)."""
+        F = self.front
+        line = F.line if now - F.at < 0.5 else None
+        if line is None:
+            return False, None, None
+        return line["conf"] >= self.params["min_conf"], line["x"], line
+
+    def burst_hold(self, now):
+        """짧은 움직임(burst)이 진행 중이면 그 명령, 막 끝났으면 멈춘 뒤에 찍힌 화면이 올 때까지 정지. 아니면 None."""
+        if now < self.burst_until:
+            self.state = self.burst_state
+            return self.burst_cmd
+        if self.burst_until and self.front.at < self.burst_until + 0.25 and now - self.burst_until < 1.5:
+            self.state = self.burst_state + " (멈추고 화면 확인)"
+            return "S"
+        return None
+
+    def start_burst(self, now, seconds, command, state):
+        self.burst_until = now + seconds
+        self.burst_cmd, self.burst_state, self.state = command, state, state
+        return command
+
+    def center_step(self, now, line):
+        """두꺼운 중앙선 위에 로버를 맞춘다 (메카넘): 옆으로 벗어난 만큼 게걸음, 방향이 틀어진 만큼 회전.
+        몸을 선과 나란히 둔 채 옆으로 옮기므로, 방향을 틀어서 맞출 때처럼 모서리가 옆 선으로 나가지 않는다.
+        크게 벗어났을 때는 전진하지 않고, 짧게 움직인 뒤 멈춰서 새 화면으로 다시 본다 (화면이 0.2~0.4초 늦어
+        계속 움직이면 지나치기 때문이다. 손 추적에서 쓰는 것과 같은 방법)."""
+        P = self.params
+        if self.f_off is None or self.burst_until:
+            self.f_off, self.f_ang = line["offset"], line["angle"]      # 처음이거나 방금 멈춘 뒤: 새 값으로 시작
+            self.burst_until = 0.0
+        else:
+            self.f_off += 0.5 * (line["offset"] - self.f_off)
+            self.f_ang += 0.5 * (line["angle"] - self.f_ang)
+        off, ang = self.f_off, self.f_ang
+        base = P["base"]
+        if abs(ang) > 0.35:
+            # 방향이 20도 넘게 틀어졌다: 제자리에서 선 방향으로 돈다 (비스듬히 전진하면 옆 선을 밟는다).
+            # 90도 도는 시간 설정에서 필요한 시간을 어림하고, 지나치지 않게 그 7할만 돈다.
+            seconds = clamp(0.7 * abs(ang) / (math.pi / 2) * P["turn90"], 0.1, 0.6)
+            return self.start_burst(now, seconds, pivot_command(1 if ang > 0 else -1, int(P["pivot"])),
+                                    f"선 방향으로 회전 ({'오른쪽' if ang > 0 else '왼쪽'})")
+        if abs(off) > P["shift_at"]:
+            # 옆으로 많이 벗어났다: 전진하지 않고 게걸음으로 선 위로 온다
+            side = -P["shift_pwm"] if off > 0 else P["shift_pwm"]         # + = 왼쪽
+            wheel = {"FL": -side, "FR": side, "RL": side, "RR": -side}
+            command = "W " + " ".join(str(int(round(wheel[name]))) for name in WHEEL_ORDER)
+            return self.start_burst(now, clamp(0.5 * abs(off), 0.15, 0.45), command,
+                                    f"선 쪽으로 게걸음 ({'오른쪽' if off > 0 else '왼쪽'})")
+        turn = clamp(-P["turn_gain"] * ang, -0.5 * base, 0.5 * base)      # + = 반시계(왼쪽)
+        side = clamp(-P["strafe_gain"] * off, -0.6 * base, 0.6 * base)    # + = 왼쪽
+        forward = base * (1 - P["slow"] * min(1.0, max(abs(off) / P["shift_at"], abs(ang) / 0.35)))
+        self.state = "선을 따라가는 중"
+        wheel = {"FL": forward - side - turn, "FR": forward + side + turn,
+                 "RL": forward + side - turn, "RR": forward - side + turn}
+        top = max(255.0, max(abs(v) for v in wheel.values()))
+        return "W " + " ".join(str(int(round(wheel[name] * 255.0 / top))) for name in WHEEL_ORDER)
+
     def line_step(self, now):
         P, p = self.params, self.percept
-        fresh = now - self.percept_at < 0.6 and bool(p.get("camera")) and now - self.frame_fresh_at < 0.6
+        fresh = (now - self.percept_at < 0.6 and bool(p.get("camera")) and now - self.frame_fresh_at < 0.6
+                 and now - self.front.at < 0.6)
         if not fresh:
             # 인식이 끊기면 바로 멈추고, 3초 넘게 끊기면 주행을 끝낸다
             if self.stale_since is None:
@@ -641,11 +981,10 @@ class Rover:
             self.state = "카메라 인식을 기다리는 중"
             return "S"
         self.stale_since = None
-        road = p.get("road") or {}
-        conf = road.get("confidence") or 0.0
-        error = road.get("error")
-        junction = road.get("junction") or "none"
-        valid = error is not None and conf >= P["min_conf"]
+        junction = (p.get("road") or {}).get("junction") or "none"       # 갈림길 표시만 스택에서 받는다
+        valid, error, line = self.line_view(now)
+        if line is not None and line["bend"] and self.wall_state == "none":
+            self.bend, self.bend_at = line["bend"], now                  # 앞에서 선이 꺾이는 쪽 (코너에서 돌 방향)
         pivot = int(P["pivot"])
 
         # STOP 표지판이 보이면 바로 자율 주행을 끝낸다. 우회나 벽 회전 중이어도, 다른 표지판보다 먼저 본다
@@ -708,6 +1047,10 @@ class Rover:
             if command is not None:
                 return command
 
+        hold = self.burst_hold(now)
+        if hold is not None:
+            return hold
+
         if valid and self.searching and (self.regain < 1 or abs(error) > 0.7):
             # 선이 다시 보이기 시작: 화면 가운데로 올 때까지 선 쪽으로 더 돈다
             self.regain += 1
@@ -731,6 +1074,8 @@ class Rover:
             if junction in ("left", "right"):
                 self.hint = -1 if junction == "left" else 1
                 self.hint_at = now
+            if P["steer"] == "strafe":
+                return self.center_step(now, line)
             self.integral = clamp(self.integral + self.filtered * dt, -0.4, 0.4)
             turn = clamp(P["kp"] * self.filtered + P["ki"] * self.integral, -P["tmax"], P["tmax"])
             speed = P["base"] * (1 - P["slow"] * min(1.0, abs(self.filtered) / 0.4))
@@ -946,6 +1291,53 @@ class Rover:
                 beat = started
             time.sleep(max(0.0, PERIOD - (time.time() - started)))
 
+    # ---------- 주행 기록 ----------
+    def record_loop(self):
+        """자율 주행·손 추적을 하는 동안 상태(초당 10번)와 화면(초당 3장)을 ~/rover_runs/auto/<시각>/ 에 남긴다.
+        주행이 이상했을 때 무엇을 보고 어떤 명령을 냈는지 나중에 보기 위한 것이다. 실패해도 주행에는 영향이 없다."""
+        folder, log, last_frame, frames = None, None, 0.0, 0
+        while True:
+            time.sleep(0.1)
+            try:
+                with self.lock:
+                    on = self.active and self.mode in ("line", "hand")
+                    if not on and log is None:
+                        continue
+                    F, now = self.front, time.time()
+                    stack = self.percept.get("road") or {}
+                    row = {
+                        "t": round(now, 2), "mode": self.mode, "state": self.state, "cmd": self.command,
+                        "line": {k: F.line[k] for k in ("x", "row", "offset", "angle", "span", "straight", "bend", "n", "conf")} if F.line else None,
+                        "left": F.left, "right": F.right, "fill": F.fill, "rows": dict(F.rows), "age": round(now - F.at, 2),
+                        "stack": [stack.get("error"), stack.get("confidence"), stack.get("junction")],
+                        "signs": [[g.get("label"), g.get("confidence"), g.get("box")] for g in self.percept.get("signs") or []],
+                        "step": [self.line_state, self.wall_state], "reason": "" if on else self.reason,
+                    }
+                if log is None:
+                    os.makedirs(AUTO_DIR, exist_ok=True)
+                    old = sorted(name for name in os.listdir(AUTO_DIR) if os.path.isdir(os.path.join(AUTO_DIR, name)))
+                    for name in old[:-11]:           # 최근 12번만 남긴다
+                        shutil.rmtree(os.path.join(AUTO_DIR, name), ignore_errors=True)
+                    folder = os.path.join(AUTO_DIR, time.strftime("%Y%m%d_%H%M%S"))
+                    os.makedirs(folder, exist_ok=True)
+                    log, frames = open(os.path.join(folder, "log.jsonl"), "w"), 0
+                if now - last_frame >= 0.33 and frames < 600:
+                    last_frame, frames = now, frames + 1
+                    row["frame"] = f"{frames:04d}.jpg"
+                    shutil.copyfile(FRAME_FILE, os.path.join(folder, row["frame"]))
+                log.write(json.dumps(row, ensure_ascii=False) + "\n")
+                if not on:
+                    log.close()
+                    log = None
+            except Exception:
+                try:
+                    if log is not None:
+                        log.close()
+                except Exception:
+                    pass
+                log = None
+                time.sleep(1.0)
+
     # ---------- 명령 ----------
     def handle(self, body):
         action = body.get("action")
@@ -1043,11 +1435,16 @@ class Rover:
             P, p, extra = self.params, self.percept, self.extra
             vision = now - self.percept_at < 1.0 and now - self.frame_fresh_at < 1.0
             road = None
-            if vision:
-                raw = p.get("road") or {}
-                error, conf = raw.get("error"), raw.get("confidence") or 0.0
-                road = {"seen": error is not None and conf >= P["min_conf"], "error": round(error or 0.0, 3),
-                        "confidence": round(conf, 3), "junction": raw.get("junction")}
+            F = self.front
+            if vision and now - F.at < 1.5:
+                line = F.line               # 굵기로 고른 중앙선 (인식 스택의 선이 아니다)
+                road = {"seen": bool(line) and line["conf"] >= P["min_conf"], "error": line["x"] if line else 0.0,
+                        "confidence": line["conf"] if line else 0.0, "junction": (p.get("road") or {}).get("junction"),
+                        "offset": line["offset"] if line else None,
+                        "angle": round(math.degrees(line["angle"]), 1) if line else None,
+                        "bend": line["bend"] if line else 0,
+                        "points": line["points"] if line else [], "thin": F.thin, "left": F.left, "right": F.right,
+                        "ms": F.line_ms}
             extra_ok = bool(extra) and now - extra.get("time", 0) < 3.0
             animals = (extra.get("animals") or []) if extra_ok and now - extra.get("animals_time", 0) < 4.0 else []
             hand = extra.get("hand") if extra_ok and now - extra.get("hand_time", 0) < 1.5 else None
@@ -1195,6 +1592,8 @@ def main():
     if "--no-watchdog" not in sys.argv:
         threading.Thread(target=rover.camera_watchdog, daemon=True).start()
     threading.Thread(target=rover.control_loop, daemon=True).start()
+    if "--no-record" not in sys.argv:
+        threading.Thread(target=rover.record_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(rover, pin))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     print(f"rover ui on port {port}, motors {'on' if rover.params['motors'] else 'OFF (dry)'}, "
