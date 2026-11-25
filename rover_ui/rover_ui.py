@@ -59,7 +59,7 @@ DEFAULTS = {
     "sign_rules": True, "stop_action": "stop", "stop_conf": 0.5, "stop_size": 0.05,
     "sign_conf": 0.75, "sign_near": 0.25,
     "detour_min": 1.2, "detour_max": 6.0,
-    "animal_action": "detour", "animal_size": 0.10, "uturn_line": "ignore", "uturn_time": 2.4,
+    "animal_action": "detour", "animal_size": 0.06, "animal_trust": "once", "uturn_line": "ignore", "uturn_time": 2.4,
     "hand_base": 130, "hand_pivot": 200, "hand_stop_area": 0.075, "hand_center": 0.35,
     "manual_speed": 150, "manual_turn": 220, "manual_strafe": 200,
     "motors": True,
@@ -77,7 +77,7 @@ LIMITS = {
 }
 CHOICES = {"turn": ("left", "right"), "stop_action": ("stop", "ignore"), "corner_mode": ("wall", "search"),
            "steer": ("strafe", "turn"),
-           "animal_action": ("detour", "wait", "ignore"), "uturn_line": ("ignore", "turn")}
+           "animal_action": ("detour", "wait", "ignore"), "animal_trust": ("once", "twice"), "uturn_line": ("ignore", "turn")}
 FLAGS = ("sign_rules", "motors")
 MOVES = {"w": (1, 0, 0), "s": (-1, 0, 0), "a": (0, 0, 1), "d": (0, 0, -1), "q": (0, 1, 0), "e": (0, -1, 0)}
 
@@ -792,20 +792,22 @@ class Rover:
         return shown if shown is not None else (self.extra.get("animals") or [])
 
     def animal_place(self, box, line):
-        """동물 박스가 내가 따라가는 선에서 어디에 있는가: 0 = 선 위, -1 = 왼쪽 옆, +1 = 오른쪽 옆.
-        선이 그 동물의 발 높이에서 지나는 곳(곧은 구간을 이은 것)과 박스를 비교한다. 선이 안 보이면 화면 가운데(정면)."""
+        """동물 박스가 내가 가는 길에서 어디에 있는가: 0 = 길 위(이대로 가면 몸통이 닿는다), -1 = 왼쪽 옆, +1 = 오른쪽 옆.
+        길 = 따라가는 선(곧은 구간을 동물의 발 높이까지 이은 것)을 가운데로 한 로버 몸통 폭. 선이 안 보이면 화면 정면.
+        몸통 반폭은 두꺼운 선 굵기의 4배로 잡는다 (선 굵기는 반 크기 화면에서 LINE_WIDTH_K * (y - 지평선) 픽셀)."""
         x1, y1, x2, y2 = box
         middle = 0.5
         if line is not None:
             fx, fy, fm = line["fit"]
             middle = fx + fm * (y2 / HEIGHT - fy)
         apart = ((x1 + x2) / 2) / WIDTH - middle
-        if abs(apart) <= 0.75 * (x2 - x1) / WIDTH + 0.03:      # 박스 반폭의 1.5배 + 여유 안으로 선이 지난다
+        body = 4.0 * LINE_WIDTH_K * max(0.0, y2 / HEIGHT * 240.0 - LINE_HORIZON) / 320.0
+        if abs(apart) <= (x2 - x1) / 2 / WIDTH + body:
             return 0
         return 1 if apart > 0 else -1
 
     def animal_ahead(self, now, line):
-        """(내가 가는 선 위에 가까이 서 있는 동물 또는 None, 그 인식 결과의 시각). 방금 한 번의 인식 결과만 본다."""
+        """(내가 가는 길 위에 서 있는 동물 또는 None, 그 인식 결과의 시각). 방금 한 번의 인식 결과만 본다."""
         P = self.params
         stamp = self.extra.get("animals_time", 0)
         if now - stamp > 2.5:
@@ -814,10 +816,10 @@ class Rover:
         for animal in self.extra.get("animals") or []:
             x1, y1, x2, y2 = animal["box"]
             tall = (y2 - y1) / HEIGHT
-            # 선 위에 있고, 발이 화면 아래쪽 6할에 닿아 있으며(바닥 위 가까운 곳), 충분히 크게 보일 때
+            # 길 위에 있고, 발이 화면 아래쪽 6할에 닿아 있으며(바닥 위 가까운 곳), 너무 작지 않을 때
             if tall >= P["animal_size"] and y2 / HEIGHT >= 0.40 and self.animal_place(animal["box"], line) == 0:
                 if best is None or tall > best["tall"]:
-                    best = {"center": ((x1 + x2) / 2) / WIDTH * 2 - 1, "tall": tall}
+                    best = {"center": ((x1 + x2) / 2) / WIDTH * 2 - 1, "tall": tall, "foot": y2 / HEIGHT}
         return best, stamp
 
     def animal_beside(self, now, line):
@@ -839,6 +841,7 @@ class Rover:
         self.detour_side = 1 if center < -0.1 else -1 if center > 0.1 else (-1 if P["turn"] == "left" else 1)
         self.line_state = "detour"
         self.detour_at = now
+        self.detour_back_until = 0.0
         self.regain = 0
         self.wall_state = "none"
         self.note(f"{what}: 그 길로 가지 않고 {'오른쪽' if self.detour_side > 0 else '왼쪽'}으로 돌아 다른 선을 찾습니다")
@@ -883,6 +886,8 @@ class Rover:
         self.animal_recent = collections.deque(maxlen=3)   # 최근 인식 결과들에서 내 선 위에 있던 동물 (없으면 None)
         self.animal_at = 0.0
         self.animal_ignore_until = 0.0
+        self.animal_after = 0.0           # 이 시각 전에 찍힌 인식 결과는 쓰지 않는다 (우회로 돌기 전의 화면)
+        self.detour_back_until = 0.0      # 우회를 시작할 때 동물이 코앞이면 이 시각까지 먼저 물러난다
         self.animal_side = 0              # 옆 길에 동물이 서 있던 쪽 (-1 왼쪽, +1 오른쪽)
         self.animal_side_at = 0.0
         self.wall_state = "none"      # none | approach | push | turn | seek
@@ -1155,44 +1160,54 @@ class Rover:
             else:
                 self.start_detour(now, near["center"], f"{name} 표지판이 가깝습니다")
 
-        # 동물이 서 있는 선으로는 가지 않는다.
+        # 동물이 서 있는 선으로는 가지 않고, 인식한 동물은 절대 치지 않는다.
         #  - 갈림길에서 다른 선이 보이면 추적기가 동물이 없는 선을 고른다 (find_line 의 blocked).
         #  - 옆 길에 서 있으면 그쪽을 기억해 두고, 다음 코너·갈림길에서 그쪽으로 돌지 않는다 (pick_side).
-        #  - 내가 가는 선 위에 있고 가까우면 멈춰서 한 번 더 확인한 뒤(인식이 약 1초에 한 번) 돌아서 다른 선을 찾는다.
+        #  - 내가 가는 길(몸통 폭) 위에 있으면: 한 번만 인식돼도 그 방향으로는 더 전진하지 않고, 돌아서 다른 선을 찾는다.
+        #    2026-11-25 18:16 기록: 코끼리를 한 번 인식하고 멈췄지만, 너무 가까워서 다음 인식이 안 되자 "없다"고 보고
+        #    다시 전진해 코끼리를 밀었다. 가까워질수록 몸이 화면 밖으로 잘려 인식이 끊긴다. 그래서 다시 확인하지 않는다.
         animal_action = P["animal_action"]
         steady = self.line_state == "follow" and self.wall_state in ("none", "approach")
         if animal_action != "ignore" and steady:
             self.front.blocked = [a["box"] for a in self.animals_shown(now)]
         else:
             self.front.blocked = []       # 도는 중에는 박스가 이미 다른 곳을 가리킨다 (인식이 1초쯤 늦다)
-        if animal_action != "ignore" and self.line_state != "detour" and now >= self.animal_ignore_until:
+        if animal_action != "ignore" and self.line_state != "detour" and self.wall_state != "turn":
             animal, stamp = self.animal_ahead(now, line)
             if stamp != self.animal_stamp:
                 self.animal_stamp = stamp
-                self.animal_recent.append(animal)
-                self.animal_at = now
-                if steady:
-                    side = self.animal_beside(now, line)
-                    if side:
-                        if side != self.animal_side or now - self.animal_side_at > 12.0:
-                            self.note(f"{'오른쪽' if side > 0 else '왼쪽'} 길에 동물이 보입니다: 그쪽으로는 돌지 않습니다")
-                        self.animal_side, self.animal_side_at = side, now
+                if stamp > self.animal_after:
+                    self.animal_recent.append(animal)
+                    self.animal_at = now
+                    if steady:
+                        side = self.animal_beside(now, line)
+                        if side:
+                            if side != self.animal_side or now - self.animal_side_at > 12.0:
+                                self.note(f"{'오른쪽' if side > 0 else '왼쪽'} 길에 동물이 보입니다: 그쪽으로는 돌지 않습니다")
+                            self.animal_side, self.animal_side_at = side, now
             elif self.animal_recent and now - self.animal_at > 3.5:
-                self.animal_recent.clear()        # 다음 인식 결과가 오지 않는다: 다시 간다
+                self.animal_recent.clear()        # 다음 인식 결과가 오지 않는다
             seen = [a for a in self.animal_recent if a]
-            latest = self.animal_recent[-1] if self.animal_recent else None
-            if len(seen) >= 2 and animal_action == "detour":
+            need = 1 if P["animal_trust"] == "once" else 2
+            if len(seen) >= need and animal_action == "detour":
+                target = seen[-1]
                 self.animal_recent.clear()
-                self.animal_ignore_until = now + 4.0
-                self.start_detour(now, seen[-1]["center"], "가는 선 위에 동물이 서 있습니다")
-            elif len(seen) >= 2 or any(list(self.animal_recent)[-2:]):
-                # 방금 또는 그 직전 결과에 보였다: 멈춰서 다음 결과를 기다린다 (전체 화면과 확대 화면을 번갈아 보므로
-                # 확대 화면에서만 잡히는 작은 동물은 한 번 걸러 한 번 보인다)
-                self.state = "동물이 선 위에 있어 기다리는 중" if len(seen) >= 2 else "가는 선 위에 동물이 보여 확인하는 중"
+                self.start_detour(now, target["center"], "가는 길 위에 동물이 서 있습니다")
+                if target["foot"] >= 0.75 or target["tall"] >= 0.30:
+                    # 코앞이다: 제자리에서 돌면 앞 모서리로 칠 수 있으니 먼저 조금 물러난다
+                    self.detour_back_until = now + 0.5
+                    self.detour_at = now + 0.5
+            elif seen:
+                # 기다림 설정이거나 한 번 더 확인하는 설정: 최근 세 번의 인식 중 한 번이라도 보였으면 서 있는다
+                self.state = "동물이 길 위에 있어 기다리는 중" if animal_action == "wait" else "가는 길 위에 동물이 보여 확인하는 중"
                 self.valid_at = None
                 return "S"
 
         if self.line_state == "detour":
+            if now < self.detour_back_until:
+                self.state = "동물이 코앞이라 조금 물러나는 중"
+                back = int(round(P["base"] * 0.8))
+                return f"M {-back} {-back}"
             elapsed = now - self.detour_at
             if elapsed > P["detour_max"]:
                 return self.stop_active("우회할 다른 길을 찾지 못해 멈췄습니다")
@@ -1207,7 +1222,8 @@ class Rover:
             self.line_state = "follow"
             self.seen = True
             self.sign_ignore_until = now + 2.0
-            self.animal_ignore_until = max(self.animal_ignore_until, now + 2.0)
+            self.animal_after = now + 0.9         # 도는 동안 찍힌 화면의 결과는 버리고, 새 결과부터 다시 본다
+            self.animal_recent.clear()
             self.note("다른 길의 선을 찾아 이어갑니다")
 
         if self.wall_state != "none":

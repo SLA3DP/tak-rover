@@ -119,6 +119,8 @@ def main():
                 for box, confidence, cls in zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist(),
                                                 result.boxes.cls.tolist()):
                     x1, y1, x2, y2 = (int(v) for v in box)
+                    if y2 - y1 >= 0.92 * picture.shape[0]:
+                        continue      # 본 화면의 높이를 다 덮는 박스는 피규어가 아니다 (벽, 바닥, 사람 다리를 잘못 읽은 것)
                     animals.append({"label": "animal", "looks_like": names[int(cls)], "view": view,
                                     "confidence": round(confidence, 3), "box": [x1 + ox, y1 + oy, x2 + ox, y2 + oy]})
                 passes[view] = (animals, time.time())

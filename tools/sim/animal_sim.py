@@ -13,15 +13,16 @@ import sim_drive as D
 R, T = D.R, D.T
 
 
-def box_of(animal, cam):
-    """세계 좌표의 동물 (x, z, 키, 몸길이) -> 640x480 화면 박스 또는 None."""
+def box_of(animal, cam, blind=0.0):
+    """세계 좌표의 동물 (x, z, 키, 몸길이) -> 640x480 화면 박스 또는 None.
+    blind: 이보다 가까우면 인식기가 못 잡는다고 친다 (가까워지면 몸이 화면 밖으로 잘려 인식이 끊긴다)."""
     ax, az, tall, wide = animal
     x, z, yaw = cam
     dx, dz = ax - x, az - z
     X = dx * math.cos(yaw) + dz * math.sin(yaw)
     Z = -dx * math.sin(yaw) + dz * math.cos(yaw)
     depth = Z * math.cos(T.PITCH) + math.sin(T.PITCH)
-    if Z < 0.3 or depth <= 0.1:
+    if Z < max(0.3, blind) or depth <= 0.1:
         return None
     u = T.CX + T.FOCAL * X / depth
     v = T.CY + T.FOCAL * (-Z * math.sin(T.PITCH) + math.cos(T.PITCH)) / depth
@@ -32,9 +33,11 @@ def box_of(animal, cam):
     return [int(max(0, b[0])), int(max(0, b[1])), int(min(639, b[2])), int(b[3])]
 
 
-def run(name, center, animal, seconds=14.0, branches=(), start=(0.0, 0.0)):
+def run(name, center, animal, seconds=14.0, branches=(), start=(0.0, 0.0), blind=0.0, far=9.0, settings=None):
+    """far: 이보다 멀면 인식기가 못 잡는다 (작게 보여서)."""
     r = R.Rover(dry=True)
     r.params.update({"steer": "strafe", "sign_rules": False})
+    r.params.update(settings or {})
     x, z, yaw = start[0], 0.0, math.radians(start[1])
     r.handle({"action": "start", "mode": "line"})
     queue, t, seq, shots, closest, last_shot = [], 1000.0, 0, [], 9.0, -9.0
@@ -44,7 +47,8 @@ def run(name, center, animal, seconds=14.0, branches=(), start=(0.0, 0.0)):
         img = T.render(center, cam, branches=branches)
         if t - last_shot >= 1.0:                      # 인식기: 1초에 한 번, 0.5초 뒤에 결과가 나온다
             last_shot = t
-            shots.append((t + 0.5, box_of(animal, cam)))
+            away = math.hypot(animal[0] - cam[0], animal[1] - cam[1])
+            shots.append((t + 0.5, box_of(animal, cam, blind) if away <= far else None))
         while shots and shots[0][0] <= t:
             _, b = shots.pop(0)
             r.extra = {"animals": [{"box": b, "confidence": 0.4, "looks_like": "dog"}] if b else [], "animals_time": t, "time": t}
@@ -78,9 +82,19 @@ def run(name, center, animal, seconds=14.0, branches=(), start=(0.0, 0.0)):
 
 if __name__ == "__main__":
     line = T.straight(40.0)
-    run("직선, 선 위에 동물 (z=7)", line, (0.0, 7.0, 0.30, 0.45))
-    run("직선, 오른쪽 옆에 동물 (x=+1.3, z=7)", line, (1.3, 7.0, 0.30, 0.45))
-    # 갈림길: 직진 선과 z=4 에서 왼쪽으로 갈라지는 선
-    fork = [(0.0, 4.0), (-1.2, 6.5), (-2.4, 12.0), (-2.4, 30.0)]
-    run("갈림길, 직진 선 위에 동물 (z=8)", line, (0.0, 8.0, 0.30, 0.45), branches=(fork,))
-    run("갈림길, 왼쪽 가지 위에 동물", line, (-2.0, 9.0, 0.30, 0.45), branches=(fork,))
+    beast = (0.30, 0.45)                       # 키, 몸길이 (카메라 높이 단위)
+    fork = [(0.0, 4.0), (-1.2, 6.5), (-2.4, 12.0), (-2.4, 30.0)]      # z=4 에서 왼쪽으로 갈라지는 선
+    cases = [
+        ("직선, 선 위에 동물 (z=7)", dict(center=line, animal=(0.0, 7.0) + beast)),
+        ("직선, 선 위 동물, 3.5 안쪽에서만 잡히고 2.5 안쪽은 못 잡음", dict(center=line, animal=(0.0, 7.0) + beast, blind=2.5, far=3.5)),
+        ("직선, 선 위 동물, 한 번 더 확인 설정 + 2.5 안쪽은 못 잡음", dict(center=line, animal=(0.0, 7.0) + beast, blind=2.5, far=3.5,
+                                                    settings={"animal_trust": "twice"})),
+        ("직선, 오른쪽 옆 멀리 (x=+1.3)", dict(center=line, animal=(1.3, 7.0) + beast)),
+        ("직선, 오른쪽 옆 가까이 (x=+0.5, 몸통에 걸림)", dict(center=line, animal=(0.5, 7.0) + beast)),
+        ("갈림길, 직진 선 위에 동물 (z=8)", dict(center=line, animal=(0.0, 8.0) + beast, branches=(fork,))),
+        ("갈림길, 왼쪽 가지 위에 동물", dict(center=line, animal=(-2.0, 9.0) + beast, branches=(fork,))),
+    ]
+    for name, kw in cases:
+        closest, pose, r = run(name, **kw)
+        touched = closest < D.HALF_L + beast[1] / 2
+        print("    =>", "동물에 닿음!!" if touched else "안 닿음")
