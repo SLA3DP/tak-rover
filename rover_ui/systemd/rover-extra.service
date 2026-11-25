@@ -1,0 +1,18 @@
+[Unit]
+Description=tak rover: animal + palm detector (rover-extra container)
+
+[Service]
+ExecStartPre=-/usr/bin/docker rm -f rover-extra
+ExecStart=/usr/bin/docker run --rm --init --name rover-extra --network none --user 1000:1000 \
+    -v %h/robot_ws:/ws:ro -v %h/rover_animals:/app \
+    -e PYTHONPATH=/ws/src/rover_autonomy -e YOLO_CONFIG_DIR=/tmp/rover-yolo -e HOME=/tmp -e OMP_NUM_THREADS=2 \
+    -e ANIMAL_CONF=0.10 -e ANIMAL_IMGSZ=448 -e ANIMAL_PERIOD=1.5 -e PALM_CONF=0.65 \
+    rover-jazzy:ncnn python3 -u /app/rover_extra.py /ws/.runtime/latest.jpg /app/out /app/yolo11n_coco.pt \
+    /ws/src/rover_autonomy/models/palm_detection_mediapipe_2023feb.onnx
+ExecStop=/usr/bin/docker stop -t 3 rover-extra
+SuccessExitStatus=130 137 143
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

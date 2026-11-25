@@ -1,0 +1,8 @@
+# 접속 번호와 로버에서 생기는 파일은 올리지 않는다
+pin.txt
+params.json
+__pycache__/
+*.pyc
+*.pt
+out/
+.DS_Store

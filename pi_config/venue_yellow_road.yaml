@@ -1,0 +1,47 @@
+camera:
+  backend: picamera2
+  source: 0
+  width: 640
+  height: 480
+  fps: 12.0
+  rotate_180: false
+perception:
+  line_backend: yellow_road
+  sign_backend: disabled  # Set to yolo when a trained project model is installed.
+  yolo_sign_model_path: null
+  palm_enabled: true
+  image_transport: compressed
+  image_topic: /rover/camera/compressed
+  fps: 12.0
+  process_on_receive: true
+  publish_debug: true
+  road:
+    independent_tracking: true
+    # Calibrated from the mounted camera: both outer lines are visible in this band.
+    roi_top: 0.62
+    roi_bottom: 0.72
+    fallback_bottoms: [0.76, 0.69]
+    hsv_low: [15, 0, 170]
+    hsv_high: [45, 255, 255]
+    min_gap_fraction: 0.09
+    max_step_fraction: 0.10
+    min_rows: 6
+    min_span_fraction: 0.05
+controller:
+  cruise_speed: 0.05
+  max_speed: 0.15
+  max_angular: 0.45
+  line_kp: 0.65
+  heading_kp: 0.20
+  road_boundary_margin: 0.18
+  road_min_confidence: 0.48
+  road_camera_timeout: 0.35
+  obstacle_distance: 0.28
+  hard_stop_distance: 0.13
+  clearance_distance: 0.42
+hardware:
+  enabled: false
+  calibrated: false
+  port: /dev/ttyACM0
+  baud: 115200
+  encoder_ticks_per_rev_by_wheel: [985, 966, 991, 962]

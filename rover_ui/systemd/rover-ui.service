@@ -1,0 +1,11 @@
+[Unit]
+Description=tak rover: web UI + driving control (port 8000)
+
+[Service]
+WorkingDirectory=%h/rover_ui
+ExecStart=/usr/bin/python3 -u %h/rover_ui/rover_ui.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=tak rover: camera feed + line/sign perception (rover-road-dashboard container)
+
+[Service]
+WorkingDirectory=%h/robot_ws
+Environment=ROVER_SERIAL_DEVICE=/dev/rover-none
+Environment=ROVER_ROAD_IMAGE=rover-jazzy:ncnn
+Environment=ROVER_ROAD_CONFIG=/ws/.runtime/venue_yolo.yaml
+ExecStartPre=-/usr/bin/docker rm rover-road-dashboard
+ExecStart=/usr/bin/bash scripts/run_road_dashboard.sh 127.0.0.1 127.0.0.1 monitor
+KillMode=mixed
+TimeoutStopSec=20
+SuccessExitStatus=130 137 143
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
