@@ -5,6 +5,7 @@
 ## 로버와 접속
 
 - Raspberry Pi 4 "tak", Raspberry Pi OS (Debian 13), 사용자 `takyeji`, 주소 `172.30.1.162` (캠퍼스 와이파이 `robot` / `robot-5G`, DHCP).
+- **주소는 재부팅하면 바뀔 수 있다.** 2026-11-25 19:30 재부팅 뒤 `172.30.10.216` 이 됐다 (처음 1분은 예전 주소로 응답하다가 바뀜). 이름 `takyeji.local` (mDNS) 로는 계속 찾을 수 있다: 화면은 `http://takyeji.local:8000`, 접속은 `ssh -o HostKeyAlias=172.30.1.162 takyeji@takyeji.local` (저장된 호스트 키로 검증). 응답이 없으면 네트워크를 훑지 말고 `dscacheutil -q host -a name takyeji.local` 로 주소를 본다.
 - 호스트 키 ED25519 지문: `SHA256:8B8BjlFAl8+UYoT2OppWpfL5tQI7STfTz3lZBngokDo`. 다르면 접속하지 말고 사용자에게 알릴 것.
 - 비밀번호 로그인만 된다. 비밀번호는 사용자가 터미널에 직접 입력한다. sudo도 비밀번호가 필요하므로 root 작업은 사용자가 실행할 스크립트로 만든다.
 - 연결을 한 번만 열고 재사용: `ssh -M -S ~/.ssh/cm-takyeji -o ControlPersist=4h -o ServerAliveInterval=15 -fN takyeji@172.30.1.162`, 이후 `ssh -S ~/.ssh/cm-takyeji -o BatchMode=yes …`. 노트북의 와이파이 주소가 바뀌거나 로버가 재부팅되면 연결이 죽는다 (`ssh -O exit` 후 다시).
