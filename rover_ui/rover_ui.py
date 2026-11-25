@@ -55,7 +55,7 @@ DEFAULTS = {
     "base": 150, "kp": 1.6, "ki": 0.6, "tmax": 0.4, "slow": 0.45, "coast": 0.5,
     "pivot": 220, "search": 3.5, "min_conf": 0.5, "turn": "right",
     "corner_mode": "wall", "turn90": 1.2, "bump_push": 1.0, "bump_max": 2.5, "wall_fill": 0.85,
-    "steer": "strafe", "strafe_gain": 150, "turn_gain": 150, "shift_at": 0.35, "shift_pwm": 220,
+    "steer": "strafe", "strafe_gain": 150, "turn_gain": 150, "shift_at": 0.35, "shift_pwm": 255,
     "sign_rules": True, "stop_action": "stop", "stop_conf": 0.5, "stop_size": 0.05,
     "sign_conf": 0.75, "sign_near": 0.25,
     "detour_min": 1.2, "detour_max": 6.0,
@@ -344,6 +344,12 @@ def find_line(a, np, hsv, hint=None):
                              for p in track[::max(1, len(track) // 6)]])
                 break
     return {"line": line, "left": sides["left"], "right": sides["right"], "thin": thin}
+
+
+def strafe_command(direction, pwm):
+    """제자리 게걸음. direction +1 = 오른쪽."""
+    wheel = {"FL": direction * pwm, "FR": -direction * pwm, "RL": -direction * pwm, "RR": direction * pwm}
+    return "W " + " ".join(str(int(round(wheel[name]))) for name in WHEEL_ORDER)
 
 
 class Uno:
@@ -779,6 +785,9 @@ class Rover:
         self.hint_at = None
         self.bend = 0                 # 마지막으로 본, 선이 앞에서 꺾이는 쪽
         self.bend_at = 0.0
+        self.shift_time = 0.4         # 멈춰서 하는 게걸음 한 번의 길이 (결과를 보고 늘리거나 줄인다)
+        self.shift_from = None
+        self.chase_until = 0.0        # 이 시각까지는 옆에 보이는 선으로 가는 중이다
         self.line_state = "follow"
         self.sign_ignore_until = 0.0
         self.near_hits = 0
@@ -792,7 +801,7 @@ class Rover:
         self.animal_hits = 0
         self.animal_at = 0.0
         self.animal_ignore_until = 0.0
-        self.wall_state = "none"      # none | approach | push | turn
+        self.wall_state = "none"      # none | approach | push | turn | seek
         self.wall_at = 0.0
         self.wall_until = 0.0
         self.wall_dir = 1
@@ -801,6 +810,7 @@ class Rover:
         self.wall_regain = 0
         self.wall_turns = 0
         self.wall_after_turn = 0.0
+        self.seek_at = 0.0
         self.wall_reversed = False
         self.wall_hits = 0
         self.open_score = 0.0
@@ -837,10 +847,52 @@ class Rover:
         speed = int(round(P["base"] * 0.8))
         straight = f"M {speed} {speed}"
         pivot = int(P["pivot"])
-        self.wall_regain = self.wall_regain + 1 if (valid and abs(error) < 0.6) else 0
+        self.wall_regain = self.wall_regain + 1 if valid else 0
+        seen = F.line if (fresh and F.line is not None and F.line["n"] >= 4) else None
+
+        if self.wall_state == "seek":
+            # 코너에서 돈 뒤: 직진하지 않고 옆으로 움직이며 두꺼운 선을 찾는다. 돈 직후에는 새 선이 화면 한쪽 끝에
+            # 조금만 보이거나 아직 안 보인다. 그대로 직진하면 선과 나란히 가면서 트랙을 벗어난다 (2026-11-25 주행 기록).
+            if self.wall_regain >= 2:
+                self.wall_state = "none"
+                self.reset_follower()
+                self.chase_until = now + 3.0
+                self.note("선을 찾아 이어갑니다")
+                return None
+            if seen is None and not self.wall_reversed and now - self.seek_at < 1.2:
+                # 선은 안 보이고 코앞이 전부 막혀 있다: 닫힌 쪽으로 돈 것이니 반대로 180도
+                self.wall_hits = self.wall_hits + 1 if (fresh and F.fill >= 0.95) else 0
+                if self.wall_hits >= 3:
+                    self.wall_reversed = True
+                    self.begin_turn(now, -self.wall_dir, 2 * P["turn90"], "돌자마자 앞이 막혀 있어 반대로")
+                    return pivot_command(self.wall_dir, pivot)
+            if now - self.seek_at < 0.4:
+                self.state = "회전 끝, 선을 찾는 중"       # 돈 직후에는 멈춰서 흔들리지 않은 화면을 먼저 본다
+                return "S"
+            hold = self.burst_hold(now)
+            if hold is not None:
+                return hold
+            waited = now - self.wall_after_turn
+            if seen is not None:
+                if abs(seen["x"]) <= 0.2:
+                    self.state = "선이 앞에 조금 보여 다가가는 중"
+                    return straight
+                side = 1 if seen["x"] > 0 else -1          # 조금이라도 보이면 그쪽으로
+                self.wall_after_turn = max(self.wall_after_turn, now - 2.0)      # 보이는 동안은 포기하지 않는다
+            if waited > 9.0 or now - self.seek_at > 16.0:
+                self.wall_state = "approach"               # 옆으로 찾아도 없다: 예전처럼 직진하며 찾는다
+                self.wall_at = now
+                self.wall_after_turn = 0.0
+                self.note("옆으로 찾아도 선이 없어 직진합니다")
+                return straight
+            if seen is None:
+                # 선은 방금까지 가던 방향 쪽에 있을 가능성이 높다 (왼쪽으로 돌았으면 오른쪽). 먼저 그쪽, 다음에 반대쪽
+                side = -self.wall_dir if waited < 3.0 else self.wall_dir
+            return self.start_burst(now, 0.6, strafe_command(side, int(P["shift_pwm"])),
+                                    f"옆으로 움직이며 선을 찾는 중 ({'오른쪽' if side > 0 else '왼쪽'})")
 
         if self.wall_state in ("approach", "push"):
-            if self.wall_regain >= 4:              # 선이 다시 또렷이 보인다
+            if self.wall_regain >= 3:              # 선이 다시 또렷이 보인다
                 self.wall_state = "none"
                 self.reset_follower()
                 self.note("선이 다시 보여 이어갑니다")
@@ -884,7 +936,7 @@ class Rover:
             self.begin_turn(now, side, P["turn90"], f"벽에 닿음 ({why})")
 
         elapsed = now - self.wall_turn_at
-        if valid and abs(error) < 0.35 and self.wall_regain >= 2 and elapsed >= 0.6 * self.wall_turn_len:
+        if valid and abs(error) < 0.5 and self.wall_regain >= 2 and elapsed >= 0.6 * self.wall_turn_len:
             self.wall_state = "none"
             self.reset_follower()
             self.note("회전 중에 선이 보여 이어갑니다")
@@ -892,14 +944,16 @@ class Rover:
         if elapsed < self.wall_turn_len:
             self.state = f"{'오른쪽' if self.wall_dir > 0 else '왼쪽'}으로 회전"
             return pivot_command(self.wall_dir, pivot)
-        self.wall_state = "approach"              # 회전 끝: 직진하면서 선을 찾는다
+        self.wall_state = "seek"                  # 회전 끝: 옆으로 움직이며 선을 찾는다
         self.wall_at = now
         self.wall_after_turn = now
+        self.seek_at = now
         self.wall_hits = 0
         self.wall_turns += 1
         self.open_score = 0.0
-        self.state = "회전 끝, 직진"
-        return straight
+        self.burst_until = 0.0
+        self.state = "회전 끝, 선을 찾는 중"
+        return "S"
 
     def stop_active(self, reason):
         self.active = False
@@ -945,6 +999,8 @@ class Rover:
             self.f_ang += 0.5 * (line["angle"] - self.f_ang)
         off, ang = self.f_off, self.f_ang
         base = P["base"]
+        if abs(line["x"]) > 0.5 or abs(off) > P["shift_at"]:
+            self.chase_until = now + 3.0      # 선이 옆으로 멀리 있다: 잠깐 짧게 보여도 코너로 치지 않고 계속 그쪽으로 간다
         if abs(ang) > 0.35:
             # 방향이 20도 넘게 틀어졌다: 제자리에서 선 방향으로 돈다 (비스듬히 전진하면 옆 선을 밟는다).
             # 90도 도는 시간 설정에서 필요한 시간을 어림하고, 지나치지 않게 그 7할만 돈다.
@@ -952,12 +1008,19 @@ class Rover:
             return self.start_burst(now, seconds, pivot_command(1 if ang > 0 else -1, int(P["pivot"])),
                                     f"선 방향으로 회전 ({'오른쪽' if ang > 0 else '왼쪽'})")
         if abs(off) > P["shift_at"]:
-            # 옆으로 많이 벗어났다: 전진하지 않고 게걸음으로 선 위로 온다
-            side = -P["shift_pwm"] if off > 0 else P["shift_pwm"]         # + = 왼쪽
-            wheel = {"FL": -side, "FR": side, "RL": side, "RR": -side}
-            command = "W " + " ".join(str(int(round(wheel[name]))) for name in WHEEL_ORDER)
-            return self.start_burst(now, clamp(0.5 * abs(off), 0.15, 0.45), command,
+            # 옆으로 많이 벗어났다: 전진하지 않고 게걸음으로 선 위로 온다.
+            # 한 번에 움직이는 시간은 지난번 결과를 보고 정한다: 거의 못 움직였으면 길게, 선을 지나쳤으면 짧게
+            # (2026-11-25 기록: 0.2초씩으로는 8번을 해도 제자리였다. 바닥과 배터리에 따라 달라진다)
+            if self.shift_from is not None:
+                if self.shift_from * off < 0:
+                    self.shift_time = max(0.12, self.shift_time * 0.5)
+                elif abs(off) > 0.8 * abs(self.shift_from):
+                    self.shift_time = min(1.2, self.shift_time * 1.5)
+            self.shift_from = off
+            self.chase_until = now + 3.0
+            return self.start_burst(now, self.shift_time, strafe_command(1 if off > 0 else -1, int(P["shift_pwm"])),
                                     f"선 쪽으로 게걸음 ({'오른쪽' if off > 0 else '왼쪽'})")
+        self.shift_from = None
         turn = clamp(-P["turn_gain"] * ang, -0.5 * base, 0.5 * base)      # + = 반시계(왼쪽)
         side = clamp(-P["strafe_gain"] * off, -0.6 * base, 0.6 * base)    # + = 왼쪽
         forward = base * (1 - P["slow"] * min(1.0, max(abs(off) / P["shift_at"], abs(ang) / 0.35)))
@@ -1050,6 +1113,12 @@ class Rover:
         hold = self.burst_hold(now)
         if hold is not None:
             return hold
+        if not valid and now < self.chase_until and line is not None and line["n"] >= 4 and abs(line["x"]) > 0.3:
+            # 옆에 있는 선으로 가던 중인데 선이 화면 끝에 걸려 잠깐 짧게 보인다: 코너로 치지 말고 계속 그쪽으로 간다
+            side = 1 if line["x"] > 0 else -1
+            self.chase_until = now + 3.0
+            return self.start_burst(now, 0.5, strafe_command(side, int(P["shift_pwm"])),
+                                    f"선이 옆에 보여 그쪽으로 게걸음 ({'오른쪽' if side > 0 else '왼쪽'})")
 
         if valid and self.searching and (self.regain < 1 or abs(error) > 0.7):
             # 선이 다시 보이기 시작: 화면 가운데로 올 때까지 선 쪽으로 더 돈다
