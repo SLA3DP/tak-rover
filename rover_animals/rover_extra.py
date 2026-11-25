@@ -81,7 +81,8 @@ def main():
         want_hand = "hand" in mode and not off
         want_animals = "animals" in mode and not off
         # "fast" 가 같이 적혀 있으면(자율 주행 중) 쉬지 않고 돌린다
-        run_animals = want_animals and now - last_animals >= (0.05 if "fast" in mode else animal_period)
+        # 쉬는 시간은 한 번 도는 시간에 더해진다 (last_animals 는 시작 시각): 선 추적과 카메라에 CPU 를 남겨 둔다
+        run_animals = want_animals and now - last_animals >= (0.9 if "fast" in mode else animal_period)
         frame = None
         if want_hand or run_animals:            # 필요할 때만 화면을 읽는다
             try:
