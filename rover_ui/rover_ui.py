@@ -58,7 +58,7 @@ DEFAULTS = {
     "steer": "strafe", "strafe_gain": 150, "turn_gain": 150, "shift_at": 0.35, "shift_pwm": 255,
     "sign_rules": True, "stop_action": "stop", "stop_conf": 0.5, "stop_size": 0.05,
     "sign_conf": 0.75, "sign_near": 0.25,
-    "detour_min": 1.2, "detour_max": 6.0,
+    "detour_min": 1.2, "detour_max": 16.0,
     "animal_action": "detour", "animal_size": 0.06, "animal_trust": "once", "uturn_line": "ignore", "uturn_time": 2.4,
     "hand_base": 130, "hand_pivot": 200, "hand_stop_area": 0.075, "hand_center": 0.35,
     "manual_speed": 150, "manual_turn": 220, "manual_strafe": 200,
@@ -70,7 +70,7 @@ LIMITS = {
     "turn90": (0.3, 3.0), "bump_push": (0, 2.5), "bump_max": (1, 6), "wall_fill": (0.6, 0.98),
     "stop_conf": (0.3, 0.99), "stop_size": (0.0, 0.9),
     "strafe_gain": (0, 600), "turn_gain": (0, 600), "shift_at": (0.1, 1.5), "shift_pwm": (120, 255),
-    "sign_conf": (0.3, 0.99), "sign_near": (0.05, 0.9), "detour_min": (0.3, 4), "detour_max": (2, 12),
+    "sign_conf": (0.3, 0.99), "sign_near": (0.05, 0.9), "detour_min": (0.3, 4), "detour_max": (2, 40),
     "animal_size": (0.05, 0.6), "uturn_time": (0.6, 6.0),
     "hand_base": (0, 255), "hand_pivot": (0, 255), "hand_stop_area": (0.01, 0.5), "hand_center": (0.1, 0.9),
     "manual_speed": (0, 255), "manual_turn": (0, 255), "manual_strafe": (0, 255),
@@ -816,8 +816,8 @@ class Rover:
         for animal in self.extra.get("animals") or []:
             x1, y1, x2, y2 = animal["box"]
             tall = (y2 - y1) / HEIGHT
-            # 길 위에 있고, 발이 화면 아래쪽 6할에 닿아 있으며(바닥 위 가까운 곳), 너무 작지 않을 때
-            if tall >= P["animal_size"] and y2 / HEIGHT >= 0.40 and self.animal_place(animal["box"], line) == 0:
+            # 길 위에 있고, 발이 화면 아래쪽 7할에 닿아 있으며(바닥 위), 너무 작지 않을 때
+            if tall >= P["animal_size"] and y2 / HEIGHT >= 0.30 and self.animal_place(animal["box"], line) == 0:
                 if best is None or tall > best["tall"]:
                     best = {"center": ((x1 + x2) / 2) / WIDTH * 2 - 1, "tall": tall, "foot": y2 / HEIGHT}
         return best, stamp
@@ -842,6 +842,8 @@ class Rover:
         self.line_state = "detour"
         self.detour_at = now
         self.detour_back_until = 0.0
+        self.detour_looking = False
+        self.burst_until = 0.0
         self.regain = 0
         self.wall_state = "none"
         self.note(f"{what}: 그 길로 가지 않고 {'오른쪽' if self.detour_side > 0 else '왼쪽'}으로 돌아 다른 선을 찾습니다")
@@ -888,6 +890,7 @@ class Rover:
         self.animal_ignore_until = 0.0
         self.animal_after = 0.0           # 이 시각 전에 찍힌 인식 결과는 쓰지 않는다 (우회로 돌기 전의 화면)
         self.detour_back_until = 0.0      # 우회를 시작할 때 동물이 코앞이면 이 시각까지 먼저 물러난다
+        self.detour_looking = False       # 우회: 돌아선 뒤 조금씩 돌며 선을 찾는 단계인가
         self.animal_side = 0              # 옆 길에 동물이 서 있던 쪽 (-1 왼쪽, +1 오른쪽)
         self.animal_side_at = 0.0
         self.wall_state = "none"      # none | approach | push | turn | seek
@@ -1179,7 +1182,7 @@ class Rover:
                 if stamp > self.animal_after:
                     self.animal_recent.append(animal)
                     self.animal_at = now
-                    if steady:
+                    if steady and now > self.burst_until + 0.5:
                         side = self.animal_beside(now, line)
                         if side:
                             if side != self.animal_side or now - self.animal_side_at > 12.0:
@@ -1211,13 +1214,25 @@ class Rover:
             elapsed = now - self.detour_at
             if elapsed > P["detour_max"]:
                 return self.stop_active("우회할 다른 길을 찾지 못해 멈췄습니다")
-            if elapsed >= P["detour_min"] and valid and abs(error) < 0.6 and near is None:
-                self.regain += 1
-            else:
-                self.regain = 0
-            if self.regain < 2:
-                self.state = "우회: 제자리에서 돌며 다른 길을 찾는 중"
+            if elapsed < P["detour_min"]:
+                # 먼저 그 길에서 돌아선다: 이 시간 동안은 보지 않고 계속 돈다
+                self.detour_looking = False
+                self.state = "우회: 돌아서는 중"
                 return pivot_command(self.detour_side, pivot)
+            # 그 뒤로는 조금 돌고 멈춰서 또렷한 화면으로 선을 찾는다. 계속 돌면 화면이 번져 선이 지나가도 못 잡는다
+            # (2026-11-25 19:28 기록: 6초 동안 한 바퀴를 돌며 선을 여러 번 지나쳤다)
+            if not self.detour_looking:
+                self.detour_looking = True
+                self.start_burst(now, 0.0, "S", "우회: 조금씩 돌며 다른 길을 찾는 중")
+            hold = self.burst_hold(now)
+            if hold is not None:
+                return hold
+            # 도는 방향의 반대쪽 끝에 걸린 선은 방금 떠나온 선일 수 있어 받지 않는다 (새 선은 도는 쪽에서 들어온다)
+            if not (valid and near is None and error * self.detour_side > -0.3):
+                return self.start_burst(now, 0.35, pivot_command(self.detour_side, pivot),
+                                        "우회: 조금씩 돌며 다른 길을 찾는 중")
+            self.burst_until = 0.0
+            self.chase_until = now + 3.0          # 선이 옆에 있으면 그쪽으로 게걸음해서 올라탄다
             self.reset_follower()
             self.line_state = "follow"
             self.seen = True
