@@ -144,7 +144,7 @@ h2 { font-size: 14px; margin: 16px 0 0; color: var(--dim); font-weight: 600; }
 
     <div id="pane-line" hidden>
       <div class="go"><button class="start" data-start="line">자율 주행 시작</button><button class="halt" data-stop>정지</button></div>
-      <p class="hint">두꺼운 중앙선만 따라갑니다. 옆으로 벗어나면 게걸음으로 가운데로 돌아오고, 얇은 테두리 선은 따라가지 않습니다. 선이 끝나거나 꺾이면(코너) 벽에 닿을 때까지 직진한 뒤 90도 돌아 이어갑니다. STOP이 보이면 바로 주행을 끝내고, 그 밖의 표지판(파란 유턴 제외)이나 동물이 길에 있으면 그 길로 가지 않고 돌아서 다른 선을 찾습니다.</p>
+      <p class="hint">두꺼운 중앙선만 따라갑니다. 옆으로 벗어나면 게걸음으로 가운데로 돌아오고, 얇은 테두리 선은 따라가지 않습니다. 선이 끝나거나 꺾이면(코너) 벽에 닿을 때까지 직진한 뒤 90도 돌아 이어갑니다. STOP이 보이면 바로 주행을 끝내고, 그 밖의 표지판(파란 유턴 제외)이 가까우면 그 길로 가지 않고 돌아서 다른 선을 찾습니다. 동물이 서 있는 선으로는 가지 않습니다: 갈림길에서는 동물이 없는 선을 고르고, 가는 선 위에 있으면 멈춰서 확인한 뒤 돌아서 다른 선을 찾습니다.</p>
       <div id="set-line"></div>
       <details><summary>세부 조정</summary><div id="set-line-more"></div></details>
     </div>
@@ -217,9 +217,9 @@ const CONTROLS = {
     {key: "stop_size", label: "STOP을 인정하는 최소 크기", min: 0, max: 0.8, step: 0.01, pct: true,
      note: "STOP 박스 높이가 화면 높이의 이 비율 이상이면 끝냅니다. 기본 5%는 아주 작은 오인식만 거르는 값입니다. 너무 멀리서 끝나면 올리세요 (아래 '표지판' 줄의 크기 숫자 참고)."},
     {key: "uturn_line", label: "파란 유턴 표지판이 가까우면", choice: [["ignore", "무시"], ["turn", "180도 회전"]]},
-    {key: "animal_action", label: "길에 동물이 보이면", choice: [["detour", "다른 길로"], ["wait", "기다림"], ["ignore", "무시"]]},
+    {key: "animal_action", label: "가는 선 위에 동물이 보이면", choice: [["detour", "다른 길로"], ["wait", "기다림"], ["ignore", "무시"]]},
     {key: "animal_size", label: "동물을 가깝다고 보는 크기", min: 0.05, max: 0.6, step: 0.01, pct: true,
-     note: "동물 박스 높이가 화면 높이의 이 비율 이상이고 화면 가운데 쪽에 있을 때 반응합니다."},
+     note: "내가 따라가는 선 위에 서 있는 동물의 박스 높이가 화면 높이의 이 비율 이상이면 멈춰서 확인한 뒤 다른 선을 찾습니다. 옆 길의 동물은 그쪽으로 돌지 않게 기억만 합니다."},
     {key: "sign_near", label: "다른 표지판을 가깝다고 보는 크기", min: 0.1, max: 0.8, step: 0.01, pct: true,
      note: "STOP이 아닌 표지판은 높이가 화면 높이의 이 비율 이상일 때 반응합니다. 아래 '표지판' 줄의 크기 숫자를 보고 맞추세요."},
     {key: "sign_conf", label: "다른 표지판 확신도 기준", min: 0.3, max: 0.98, step: 0.01, pct: true,
@@ -412,7 +412,7 @@ function paint() {
   const facts = [];
   if (st.view !== "hand") {
     const side = value => value == null ? "안 보임" : Math.abs(value).toFixed(2);
-    facts.push(["선", road ? (road.offset != null ? `두꺼운 중앙선 ${road.seen ? "보임" : "짧게 보임 (따라가기엔 부족)"}${road.bend ? (road.bend > 0 ? " · 앞에서 오른쪽으로 꺾임" : " · 앞에서 왼쪽으로 꺾임") : ""} · 옆으로 ${road.offset > 0.02 ? "오른쪽" : road.offset < -0.02 ? "왼쪽" : "가운데"} ${Math.abs(road.offset).toFixed(2)} · 방향 ${road.angle > 2 ? "오른쪽" : road.angle < -2 ? "왼쪽" : "나란함"} ${Math.abs(road.angle).toFixed(0)}° · 확신도 ${pct(road.confidence)} · 얇은 선까지 왼쪽 ${side(road.left)} / 오른쪽 ${side(road.right)}` : `두꺼운 중앙선 안 보임 · 얇은 선 왼쪽 ${side(road.left)} / 오른쪽 ${side(road.right)}`) : "인식 결과 없음"]);
+    facts.push(["선", road ? (road.offset != null ? `두꺼운 중앙선 ${road.seen ? "보임" : "짧게 보임 (따라가기엔 부족)"}${road.bend ? (road.bend > 0 ? " · 앞에서 오른쪽으로 꺾임" : " · 앞에서 왼쪽으로 꺾임") : ""} · 옆으로 ${road.offset > 0.02 ? "오른쪽" : road.offset < -0.02 ? "왼쪽" : "가운데"} ${Math.abs(road.offset).toFixed(2)} · 방향 ${road.angle > 2 ? "오른쪽" : road.angle < -2 ? "왼쪽" : "나란함"} ${Math.abs(road.angle).toFixed(0)}° · 확신도 ${pct(road.confidence)}${road.blocked ? " · 이 선 위에 동물이 서 있음" : road.avoided ? " · 동물이 서 있는 선을 피해 고른 선" : ""} · 얇은 선까지 왼쪽 ${side(road.left)} / 오른쪽 ${side(road.right)}` : `두꺼운 중앙선 안 보임 · 얇은 선 왼쪽 ${side(road.left)} / 오른쪽 ${side(road.right)}`) : "인식 결과 없음"]);
   }
   facts.push(["표지판", st.signs.length ? st.signs.map(sign => `${signName(sign)} ${pct(sign.confidence)} · 크기 ${pct(sign.tall)}${sign.near ? (sign.kind === "stop" ? " · 주행 종료 대상" : " · 가까움") : sign.cut ? " · 화면 옆·아래 끝에 걸려 제외" : sign.sure ? "" : " · 확신도 낮음"}`).join(" / ") : "없음"]);
   if (st.view !== "hand") {

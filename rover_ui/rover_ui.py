@@ -59,7 +59,7 @@ DEFAULTS = {
     "sign_rules": True, "stop_action": "stop", "stop_conf": 0.5, "stop_size": 0.05,
     "sign_conf": 0.75, "sign_near": 0.25,
     "detour_min": 1.2, "detour_max": 6.0,
-    "animal_action": "detour", "animal_size": 0.16, "uturn_line": "ignore", "uturn_time": 2.4,
+    "animal_action": "detour", "animal_size": 0.10, "uturn_line": "ignore", "uturn_time": 2.4,
     "hand_base": 130, "hand_pivot": 200, "hand_stop_area": 0.075, "hand_center": 0.35,
     "manual_speed": 150, "manual_turn": 220, "manual_strafe": 200,
     "motors": True,
@@ -208,8 +208,29 @@ def _trace_up(rows, start, x, width, w, h, stride, thick):
     return points
 
 
-def find_line(a, np, hsv, hint=None):
+def _runs_into(track, boxes, horizon, h):
+    """선(track: 아래에서 위로 (y, x, 폭) 점들)이 동물 박스에 닿으면 그 박스, 아니면 None.
+    선의 점이 박스 아래쪽 절반(발이 바닥에 닿는 곳)을 지나거나, 선이 박스 바로 아래에서 끊겼고 끝부분의 방향대로
+    이으면 발 높이에서 박스 안을 지날 때 닿는 것으로 본다. boxes: 이 화면 기준 (x1, y1, x2, y2)."""
+    ty, tx = track[-1][0], track[-1][1]
+    slope = _fit_line([(p[0], p[1]) for p in track[-min(len(track), 6):]])[1]
+    for box in boxes:
+        x1, y1, x2, y2 = box
+        wide = LINE_WIDTH_K * max(1.0, y2 - horizon)
+        pad = 0.25 * (x2 - x1) + wide
+        lo, hi = x1 - pad, x2 + pad
+        feet = y1 + 0.5 * (y2 - y1)
+        if any(feet <= py <= y2 + wide and lo <= px <= hi for py, px, _ in track):
+            return box
+        if y2 < ty <= y2 + 0.25 * h and lo <= tx + slope * (y2 - ty) <= hi:
+            return box
+    return None
+
+
+def find_line(a, np, hsv, hint=None, blocked=()):
     """반 크기 RGB 화면에서 두꺼운 중앙선과 양옆 얇은 테두리 선을 찾는다.
+    blocked: 동물 박스들 (이 화면 기준 x1, y1, x2, y2). 그 박스에 닿는 선은 고르지 않는다. 다른 선이 없을 때만
+    그 선을 돌려주고 blocked = True, animal = 그 동물의 크기와 위치를 붙인다 (따라갈지는 부르는 쪽이 정한다).
 
     line (없으면 None): x 가까운 점의 좌우 위치 -1..1, row 그 점의 높이 0..1, offset 로버(카메라) 밑에서 선이 옆으로
     떨어진 거리(카메라 높이 단위, + = 선이 오른쪽), angle 선 방향 - 로버 방향(rad, + = 선이 오른쪽으로 향함),
@@ -263,6 +284,7 @@ def find_line(a, np, hsv, hint=None):
     cos_p, tan_p = math.cos(LINE_PITCH), math.tan(LINE_PITCH)
     target = hint if hint is not None else w / 2.0
     best, best_score, used, seeded = None, None, set(), 0
+    shut, shut_score, shut_box = None, None, None       # 동물이 서 있는 선 중 가장 좋은 것
     for i, (y, wide, runs) in enumerate(rows):
         if seeded >= 14:
             break
@@ -295,11 +317,15 @@ def find_line(a, np, hsv, hint=None):
             if ratios[len(ratios) // 2] < 0.5:
                 continue
             score = len(track) - 0.1 * abs(x0 - target) / scale
-            if best_score is None or score > best_score:
+            box = _runs_into(track, blocked, horizon, h) if blocked else None
+            if box is not None:
+                if shut_score is None or score > shut_score:
+                    shut, shut_score, shut_box = (track, x0, m, k), score, box
+            elif best_score is None or score > best_score:
                 best, best_score = (track, x0, m, k), score
-    line, tan_angle = None, None
-    if best is not None:
-        track, x0, m, k = best
+
+    def describe(found):
+        track, x0, m, k = found
         y0 = track[0][0]
         span = track[0][0] - track[-1][0] + stride
         straight = track[0][0] - track[k - 1][0] + stride
@@ -309,7 +335,7 @@ def find_line(a, np, hsv, hint=None):
             bend = 1 if far[1] > x0 + m * (far[0] - y0) else -1
         # 바닥의 직선은 화면에서도 직선이다: 지평선에서 만나는 점이 방향을, 기울기가 옆 거리를 준다
         tan_angle = (x0 - m * (y0 - horizon) - w / 2.0) * cos_p / focal
-        line = {
+        return {
             "x": round(clamp(x0 / (w / 2.0) - 1.0, -1.0, 1.0), 3), "row": round(y0 / (h - 1.0), 3),
             "offset": round(m / cos_p + tan_p * tan_angle, 3), "angle": round(math.atan(tan_angle), 3),
             "span": round(span / float(h), 3), "n": len(track),
@@ -319,7 +345,27 @@ def find_line(a, np, hsv, hint=None):
             "conf": round(min(1.0, straight / ((0.44 if bend else 0.32) * h)) * min(1.0, k * stride / float(straight)), 3),
             "points": [[round(p[1] / (w - 1.0), 3), round(p[0] / (h - 1.0), 3)]
                        for p in track[::max(1, len(track) // 9)]],
-        }
+            # 화면에서의 직선 (가로·세로 모두 0..1): x = fit[0] + fit[2] * (y - fit[1])
+            "fit": [round(x0 / (w - 1.0), 4), round(y0 / (h - 1.0), 4), round(m * (h - 1.0) / (w - 1.0), 4)],
+            "blocked": False,
+        }, tan_angle
+
+    line, tan_angle, chosen = None, None, None
+    if best is not None:
+        (line, tan_angle), chosen = describe(best), best
+    if shut is not None:
+        if line is None or line["conf"] < 0.5:
+            # 동물이 없는 다른 선이 없다(또는 따라가기엔 너무 짧다): 동물이 서 있는 선임을 알리고 돌려준다
+            (line, tan_angle), chosen = describe(shut), shut
+            bx1, by1, bx2, by2 = shut_box
+            line["blocked"] = True
+            line["animal"] = {"center": round((bx1 + bx2) / float(w) - 1.0, 3), "tall": round((by2 - by1) / float(h), 3),
+                              "foot": round(by2 / float(h), 3)}
+        else:
+            line["avoided"] = True            # 동물이 서 있는 선 대신 고른 선
+    if chosen is not None:
+        track, x0, m, k = chosen
+        y0 = track[0][0]
 
     # 2) 얇은 테두리 선: 화면 아래쪽에서, 두꺼운 선의 양옆으로 가장 가까운 것
     sides, thin = {"left": None, "right": None}, []
@@ -328,7 +374,7 @@ def find_line(a, np, hsv, hint=None):
         for i, (y, wide, runs) in enumerate(rows):
             if y < h * 0.45 or tried >= 10:
                 break
-            middle = (x0 + m * (y - y0)) if best is not None else w / 2.0
+            middle = (x0 + m * (y - y0)) if chosen is not None else w / 2.0
             pool = [((s0 + e0 - 1) / 2.0, e0 - s0) for s0, e0 in runs
                     if 2 <= e0 - s0 <= 0.45 * wide and sign * ((s0 + e0 - 1) / 2.0 - middle) > 0.5 * wide]
             if not pool:
@@ -428,6 +474,7 @@ class Front:
         self.right = None
         self.thin = []
         self.line_ms = 0.0
+        self.blocked = []             # 동물 박스들 (640×480 기준). 여기에 닿는 선은 고르지 않는다 (Rover 가 채운다)
 
     def colors(self, box):
         """640×480 기준 [x1, y1, x2, y2] 안에서 파란색, 빨간색 픽셀이 차지하는 비율."""
@@ -488,7 +535,10 @@ class Front:
                     began = time.time()
                     try:
                         hint = (self.line["x"] + 1.0) / 2.0 * pixels.shape[1] if self.line else None
-                        found, problem = find_line(pixels, np, self.hsv, hint), ""
+                        ph, pw = pixels.shape[:2]
+                        boxes = [(b[0] * pw / WIDTH, b[1] * ph / HEIGHT, b[2] * pw / WIDTH, b[3] * ph / HEIGHT)
+                                 for b in self.blocked]
+                        found, problem = find_line(pixels, np, self.hsv, hint, boxes), ""
                     except Exception as issue:      # 선 추적이 실패해도 벽 판단과 나머지는 계속 돈다
                         found = {"line": None, "left": None, "right": None, "thin": []}
                         problem = f"선 추적 오류: {type(issue).__name__}"
@@ -734,8 +784,28 @@ class Rover:
         self.near_seq = seq
         return near, near is not None and self.near_hits >= 2
 
-    def animal_ahead(self, now):
-        """(가는 길 앞에 가까이 있는 동물 중 가장 큰 것 또는 None, 그 인식 결과의 시각)."""
+    def animals_shown(self, now, limit=2.5):
+        """최근에 보인 동물들 (전체 화면과 확대 화면 결과를 합친 것). 인식 결과가 오래됐으면 빈 목록."""
+        if now - self.extra.get("animals_time", 0) > limit:
+            return []
+        shown = self.extra.get("animals_shown")
+        return shown if shown is not None else (self.extra.get("animals") or [])
+
+    def animal_place(self, box, line):
+        """동물 박스가 내가 따라가는 선에서 어디에 있는가: 0 = 선 위, -1 = 왼쪽 옆, +1 = 오른쪽 옆.
+        선이 그 동물의 발 높이에서 지나는 곳(곧은 구간을 이은 것)과 박스를 비교한다. 선이 안 보이면 화면 가운데(정면)."""
+        x1, y1, x2, y2 = box
+        middle = 0.5
+        if line is not None:
+            fx, fy, fm = line["fit"]
+            middle = fx + fm * (y2 / HEIGHT - fy)
+        apart = ((x1 + x2) / 2) / WIDTH - middle
+        if abs(apart) <= 0.75 * (x2 - x1) / WIDTH + 0.03:      # 박스 반폭의 1.5배 + 여유 안으로 선이 지난다
+            return 0
+        return 1 if apart > 0 else -1
+
+    def animal_ahead(self, now, line):
+        """(내가 가는 선 위에 가까이 서 있는 동물 또는 None, 그 인식 결과의 시각). 방금 한 번의 인식 결과만 본다."""
         P = self.params
         stamp = self.extra.get("animals_time", 0)
         if now - stamp > 2.5:
@@ -743,13 +813,25 @@ class Rover:
         best = None
         for animal in self.extra.get("animals") or []:
             x1, y1, x2, y2 = animal["box"]
-            center = ((x1 + x2) / 2) / WIDTH * 2 - 1
             tall = (y2 - y1) / HEIGHT
-            # 화면 가운데 쪽에 있고, 발이 화면 아래쪽 절반에 닿아 있으며(바닥 위 가까운 곳), 충분히 크게 보일 때
-            if abs(center) < 0.55 and y2 / HEIGHT >= 0.45 and tall >= P["animal_size"]:
+            # 선 위에 있고, 발이 화면 아래쪽 6할에 닿아 있으며(바닥 위 가까운 곳), 충분히 크게 보일 때
+            if tall >= P["animal_size"] and y2 / HEIGHT >= 0.40 and self.animal_place(animal["box"], line) == 0:
                 if best is None or tall > best["tall"]:
-                    best = {"center": center, "tall": tall}
+                    best = {"center": ((x1 + x2) / 2) / WIDTH * 2 - 1, "tall": tall}
         return best, stamp
+
+    def animal_beside(self, now, line):
+        """옆 길에 서 있는 동물 중 가장 크게 보이는 것이 내 선의 어느 쪽인가 (-1 왼쪽, +1 오른쪽, 0 없음)."""
+        best, side = 0.0, 0
+        for animal in self.animals_shown(now):
+            x1, y1, x2, y2 = animal["box"]
+            tall = (y2 - y1) / HEIGHT
+            if tall < 0.04 or y2 / HEIGHT < 0.30 or tall <= best:
+                continue
+            place = self.animal_place(animal["box"], line)
+            if place:
+                best, side = tall, place
+        return side
 
     def start_detour(self, now, center, what):
         """그쪽으로 가지 않는다: 보이는 쪽의 반대로 제자리 회전하며 다른 선을 찾는다 (정면이면 기본 방향)."""
@@ -798,9 +880,11 @@ class Rover:
         self.detour_at = 0.0
         self.stale_since = None
         self.animal_stamp = None
-        self.animal_hits = 0
+        self.animal_recent = collections.deque(maxlen=3)   # 최근 인식 결과들에서 내 선 위에 있던 동물 (없으면 None)
         self.animal_at = 0.0
         self.animal_ignore_until = 0.0
+        self.animal_side = 0              # 옆 길에 동물이 서 있던 쪽 (-1 왼쪽, +1 오른쪽)
+        self.animal_side_at = 0.0
         self.wall_state = "none"      # none | approach | push | turn | seek
         self.wall_at = 0.0
         self.wall_until = 0.0
@@ -821,6 +905,7 @@ class Rover:
         self.wall_state = "turn"
         self.wall_dir = direction
         self.bend_at = 0.0            # 꺾인 쪽 기억은 이번 회전에 썼다: 다음 코너는 새로 본 것으로 정한다
+        self.animal_side_at = 0.0
         self.wall_turn_at = now
         self.wall_turn_len = length
         self.wall_regain = 0
@@ -830,6 +915,8 @@ class Rover:
 
     def pick_side(self, now):
         """도는 방향과 그 근거. +1 = 오른쪽."""
+        if now - self.animal_side_at < 12.0:
+            return -self.animal_side, "동물이 없는 쪽"       # 동물이 서 있는 길로는 돌지 않는다
         if now - self.bend_at < 4.0:
             return self.bend, "선이 꺾인 쪽"
         if now - self.open_at < 3.0 and abs(self.open_score) >= 0.1:
@@ -1068,22 +1155,40 @@ class Rover:
             else:
                 self.start_detour(now, near["center"], f"{name} 표지판이 가깝습니다")
 
-        # 길 위에 동물이 보이면 그 길로 가지 않는다. 인식이 느려(약 1초에 한 번) 처음 보이면 멈춰서 한 번 더 확인한다
+        # 동물이 서 있는 선으로는 가지 않는다.
+        #  - 갈림길에서 다른 선이 보이면 추적기가 동물이 없는 선을 고른다 (find_line 의 blocked).
+        #  - 옆 길에 서 있으면 그쪽을 기억해 두고, 다음 코너·갈림길에서 그쪽으로 돌지 않는다 (pick_side).
+        #  - 내가 가는 선 위에 있고 가까우면 멈춰서 한 번 더 확인한 뒤(인식이 약 1초에 한 번) 돌아서 다른 선을 찾는다.
         animal_action = P["animal_action"]
+        steady = self.line_state == "follow" and self.wall_state in ("none", "approach")
+        if animal_action != "ignore" and steady:
+            self.front.blocked = [a["box"] for a in self.animals_shown(now)]
+        else:
+            self.front.blocked = []       # 도는 중에는 박스가 이미 다른 곳을 가리킨다 (인식이 1초쯤 늦다)
         if animal_action != "ignore" and self.line_state != "detour" and now >= self.animal_ignore_until:
-            animal, stamp = self.animal_ahead(now)
+            animal, stamp = self.animal_ahead(now, line)
             if stamp != self.animal_stamp:
                 self.animal_stamp = stamp
-                self.animal_hits = self.animal_hits + 1 if animal else 0
+                self.animal_recent.append(animal)
                 self.animal_at = now
-            elif self.animal_hits and now - self.animal_at > 3.5:
-                self.animal_hits = 0              # 다음 인식 결과가 오지 않는다: 다시 간다
-            if self.animal_hits >= 2 and animal and animal_action == "detour":
-                self.animal_hits = 0
+                if steady:
+                    side = self.animal_beside(now, line)
+                    if side:
+                        if side != self.animal_side or now - self.animal_side_at > 12.0:
+                            self.note(f"{'오른쪽' if side > 0 else '왼쪽'} 길에 동물이 보입니다: 그쪽으로는 돌지 않습니다")
+                        self.animal_side, self.animal_side_at = side, now
+            elif self.animal_recent and now - self.animal_at > 3.5:
+                self.animal_recent.clear()        # 다음 인식 결과가 오지 않는다: 다시 간다
+            seen = [a for a in self.animal_recent if a]
+            latest = self.animal_recent[-1] if self.animal_recent else None
+            if len(seen) >= 2 and animal_action == "detour":
+                self.animal_recent.clear()
                 self.animal_ignore_until = now + 4.0
-                self.start_detour(now, animal["center"], "길에 동물이 있습니다")
-            elif self.animal_hits >= 1:
-                self.state = "동물이 길에 있어 기다리는 중" if self.animal_hits >= 2 else "동물이 보여 확인하는 중"
+                self.start_detour(now, seen[-1]["center"], "가는 선 위에 동물이 서 있습니다")
+            elif len(seen) >= 2 or any(list(self.animal_recent)[-2:]):
+                # 방금 또는 그 직전 결과에 보였다: 멈춰서 다음 결과를 기다린다 (전체 화면과 확대 화면을 번갈아 보므로
+                # 확대 화면에서만 잡히는 작은 동물은 한 번 걸러 한 번 보인다)
+                self.state = "동물이 선 위에 있어 기다리는 중" if len(seen) >= 2 else "가는 선 위에 동물이 보여 확인하는 중"
                 self.valid_at = None
                 return "S"
 
@@ -1343,6 +1448,8 @@ class Rover:
                     self.command = command
                     live = self.params["motors"]
                     self.front.fast = self.active and self.mode in ("line", "hand")
+                    if not (self.active and self.mode == "line"):
+                        self.front.blocked = []
                     self.write_mode()
             except Exception as problem:      # 계산이 실패하면 멈춘다
                 with self.lock:
@@ -1381,6 +1488,10 @@ class Rover:
                         "stack": [stack.get("error"), stack.get("confidence"), stack.get("junction")],
                         "signs": [[g.get("label"), g.get("confidence"), g.get("box")] for g in self.percept.get("signs") or []],
                         "step": [self.line_state, self.wall_state], "reason": "" if on else self.reason,
+                        "animals": [[a.get("looks_like"), a.get("confidence"), a.get("box"), a.get("view")] for a in self.extra.get("animals") or []],
+                        "animal_age": round(now - self.extra.get("animals_time", 0), 2),
+                        "blocked": bool(F.line and F.line.get("blocked")), "avoided": bool(F.line and F.line.get("avoided")),
+                        "animal_side": self.animal_side if now - self.animal_side_at < 12.0 else 0,
                     }
                 if log is None:
                     os.makedirs(AUTO_DIR, exist_ok=True)
@@ -1512,10 +1623,11 @@ class Rover:
                         "offset": line["offset"] if line else None,
                         "angle": round(math.degrees(line["angle"]), 1) if line else None,
                         "bend": line["bend"] if line else 0,
+                        "blocked": bool(line and line.get("blocked")), "avoided": bool(line and line.get("avoided")),
                         "points": line["points"] if line else [], "thin": F.thin, "left": F.left, "right": F.right,
                         "ms": F.line_ms}
             extra_ok = bool(extra) and now - extra.get("time", 0) < 3.0
-            animals = (extra.get("animals") or []) if extra_ok and now - extra.get("animals_time", 0) < 4.0 else []
+            animals = self.animals_shown(now, 4.0) if extra_ok else []
             hand = extra.get("hand") if extra_ok and now - extra.get("hand_time", 0) < 1.5 else None
             try:
                 camera = now - os.stat(FRAME_FILE).st_mtime < 2.0
