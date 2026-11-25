@@ -41,7 +41,7 @@
 ### 구조
 
 ```mermaid
-flowchart LR
+flowchart TD
     cam[카메라] --> feed[카메라 저장 프로그램]
     feed --> jpg[(최신 화면 1장)]
     jpg --> stack[rover-perception<br>선·표지판 인식]
